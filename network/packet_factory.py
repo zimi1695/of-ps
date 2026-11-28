@@ -1,4 +1,5 @@
 import logging
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
@@ -8,6 +9,7 @@ from config import Config
 from network.msg_id import MsgId
 from network.packet_handler import PacketHandler
 from proto import net_pb2
+from utils import event_trace, metrics as metrics_registry
 from utils.scanner import scan_handlers
 
 logger = logging.getLogger(__name__)
@@ -75,13 +77,18 @@ class PacketFactory:
             session.send(msg_id + 1, b"\x08\x02", packet_id, True)
             return True
 
+        trace_id = getattr(session, "_incoming_trace_id", 0)
+        produced_at_us = getattr(session, "_incoming_produced_at_us", 0)
         if msg_id in cls._SYNC_CMDS or msg_id in Config.DUNGEON_ORDERED_MESSAGE_IDS:
             with cls._state_lock:
                 if not cls._accepting:
                     return False
             # 登录/有序链路保持在会话读线程内，避免同连接乱序。
-            return cls._handle_packet(handler, session, data, packet_id, msg_id)
+            return cls._handle_packet(
+                handler, session, data, packet_id, msg_id, trace_id, produced_at_us
+            )
 
+        queued_at_ns = time.perf_counter_ns()
         with cls._state_lock:
             executor = cls._executor
             pending_bytes = cls._pending_bytes
@@ -96,7 +103,15 @@ class PacketFactory:
                 rejected = False
                 try:
                     future = executor.submit(
-                        cls._handle_packet, handler, session, data, packet_id, msg_id
+                        cls._handle_packet,
+                        handler,
+                        session,
+                        data,
+                        packet_id,
+                        msg_id,
+                        trace_id,
+                        produced_at_us,
+                        queued_at_ns,
                     )
                 except RuntimeError:
                     rejected = True
@@ -119,7 +134,23 @@ class PacketFactory:
             cls._pending_bytes -= cls._pending_sizes.pop(future, 0)
 
     @classmethod
-    def _handle_packet(cls, handler, session, data: bytes, packet_id: int, msg_id: int):
+    def _handle_packet(
+        cls,
+        handler,
+        session,
+        data: bytes,
+        packet_id: int,
+        msg_id: int,
+        trace_id=0,
+        produced_at_us=0,
+        queued_at_ns=0,
+    ):
+        if queued_at_ns:
+            metrics_registry.metrics.observe(
+                "ofps.trace.handler_queue_seconds",
+                (time.perf_counter_ns() - queued_at_ns) / 1e9,
+            )
+        token = event_trace.activate(event_trace.new_trace(trace_id, produced_at_us))
         try:
             if not session.running:
                 return
@@ -129,6 +160,8 @@ class PacketFactory:
             logger.error("Error processing %s packet: \n%s", msg_id, exception_traceback)
             cls._log_unknown_packet(msg_id, data)
             session.send(msg_id + 1, b"\x08\x02", packet_id, True)
+        finally:
+            event_trace.reset(token)
 
     @classmethod
     def _log_unknown_packet(cls, msg_id: int, data: bytes):

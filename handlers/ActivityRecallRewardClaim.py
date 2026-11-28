@@ -1,3 +1,6 @@
+import json
+import logging
+
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
 
@@ -8,8 +11,10 @@ from proto.net_pb2 import (
     PackNotice,
 )
 from config import Config
-import utils.db as db
+from server import redemption
 from utils import achieve_track
+
+logger = logging.getLogger(__name__)
 
 """
 # 回归活动领取奖励 4511 4512
@@ -22,37 +27,50 @@ class Handler(PacketHandler):
         req = ActivityRecallRewardClaimReq()
         req.ParseFromString(data)
 
-        rsp = ActivityRecallRewardClaimRsp()
-        rsp.status = StatusCode.StatusCode_OK
-        rsp.activity_id = req.activity_id
-        rsp.condition_id = req.condition_id
-
-        if not db.try_claim(
-            session.player_id,
-            "activity_recall",
-            f"{req.activity_id}:{req.condition_id}",
-        ):
-            rsp.status = StatusCode.StatusCode_REPEAT_GET_REWARD
-            session.send(
-                MsgId.ActivityRecallRewardClaimRsp, rsp, packet_id
-            )  # 4511,4512
-            return
-
+        rsp = ActivityRecallRewardClaimRsp(
+            status=StatusCode.StatusCode_OK,
+            activity_id=req.activity_id,
+            condition_id=req.condition_id,
+        )
         rewards = Config.ACTIVITY_RECALL_REWARDS.get(
             (req.activity_id, req.condition_id),
-            Config.ACTIVITY_RECALL_REWARDS.get(('*', '*'), ()),
+            Config.ACTIVITY_RECALL_REWARDS.get(("*", "*"), ()),
         )
-        if not rewards:
-            db.rollback_claim(session.player_id, "activity_recall", f"{req.activity_id}:{req.condition_id}")
-            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+        fingerprint = json.dumps(
+            [req.activity_id, req.condition_id], separators=(",", ":")
+        )
+        pack = PackNotice(status=StatusCode.StatusCode_OK)
+        try:
+            with achieve_track.batch(session):
+                status, _ = redemption.claim_reward(
+                    session.player_id,
+                    "activity_recall",
+                    f"{req.activity_id}:{req.condition_id}",
+                    rewards,
+                    rsp.rewards,
+                    pack,
+                    packet_id=packet_id,
+                    fingerprint=fingerprint,
+                    response=rsp,
+                    on_success=lambda: achieve_track.report(session, "recall_player"),
+                )
+        except Exception:
+            # Claim marker, rewards and packet operation all share the transaction.
+            logger.exception("Recall reward fulfillment failed")
+            rsp.Clear()
+            rsp.activity_id = req.activity_id
+            rsp.condition_id = req.condition_id
+            rsp.status = StatusCode.StatusCode_SYS_ERR
             session.send(MsgId.ActivityRecallRewardClaimRsp, rsp, packet_id)
             return
 
-        pack = PackNotice()
-        pack.status = StatusCode.StatusCode_OK
-        db.grant_rewards(session.player_id, rewards, rsp.rewards, pack)
-
-        # 成就: 成功召回玩家
-        achieve_track.report(session, "recall_player")
-        session.send(MsgId.ActivityRecallRewardClaimRsp, rsp, packet_id)  # 4511,4512
-        session.send(MsgId.PackNotice, pack, 0)
+        status_map = {
+            "ok": StatusCode.StatusCode_OK,
+            "already_claimed": StatusCode.StatusCode_REPEAT_GET_REWARD,
+            "invalid_rewards": StatusCode.StatusCode_CFG_NOT_FOUND,
+            "conflict": StatusCode.StatusCode_BAD_REQ,
+        }
+        rsp.status = status_map.get(status, StatusCode.StatusCode_SYS_ERR)
+        session.send(MsgId.ActivityRecallRewardClaimRsp, rsp, packet_id)
+        if status == "ok" and pack.items:
+            session.send(MsgId.PackNotice, pack, 0)

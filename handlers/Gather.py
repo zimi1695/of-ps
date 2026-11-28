@@ -6,6 +6,7 @@ from network.msg_id import MsgId
 from network.packet_handler import PacketHandler, packet_handler
 from proto.net_pb2 import GatherReq, GatherRsp, PackNotice, StatusCode
 import utils.db as db
+from server import entity_authority
 from utils import achieve_track, item_mgr, refresh
 from utils.pb_create import make_Achieve
 from utils.res_loader import res
@@ -120,6 +121,23 @@ class Handler(PacketHandler):
 
         daily_key = f"{column}:{refresh.day_index()}"
         point_key = f"{session.scene_id}:{session.channel_id}:{req.gather_item.index}"
+        authority = entity_authority.active()
+        if authority is None:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.GatherRsp, rsp, packet_id)
+            return
+        try:
+            authority.assert_owner(
+                entity_authority.entity_domain(
+                    "gather", session.scene_id, session.channel_id
+                ),
+                req.gather_item.index,
+                require_shared=Config.LINK_OTHER_SERVER,
+            )
+        except entity_authority.OwnershipError:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.GatherRsp, rsp, packet_id)
+            return
         now = int(time.time())
         pack = PackNotice(status=StatusCode.StatusCode_OK)
         with (

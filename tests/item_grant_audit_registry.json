@@ -4,21 +4,21 @@
     "of-ps/handlers/AbilityBadgeAchieveReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@81"
+        "grant_items@82"
       ],
       "category": "reward",
       "idempotency": "claimed-rewards-ledger",
       "transaction": "item-manager-transaction-only",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/handlers/AbilityBadgePageBoxActive.py::_handle": {
+    "of-ps/handlers/AbilityBadgePageBoxActive.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@91"
+        "grant_items@116"
       ],
       "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-node-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/AbilityBadgePageReward.py::handle": {
@@ -41,34 +41,34 @@
       "transaction": "sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/handlers/ActivityRecallRewardClaim.py::handle": {
-      "callCount": 1,
-      "calls": [
-        "grant_rewards@53"
-      ],
-      "category": "activity",
-      "idempotency": "claimed-rewards-ledger",
-      "transaction": "item-manager-transaction-only",
-      "durability": "sqlite-wal-full"
-    },
     "of-ps/handlers/ActivitySandbagReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_rewards@94"
+        "grant_items@157"
       ],
       "category": "activity",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "persistent-per-player-claim-plus-packet-operation",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/AreaUnlock.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@54"
+        "grant_items@57"
       ],
       "category": "other",
       "idempotency": "persistent-state-check",
       "transaction": "item-manager-transaction-only",
+      "durability": "sqlite-wal-full"
+    },
+    "of-ps/handlers/BlessTreeUnlock.py::handle": {
+      "callCount": 1,
+      "calls": [
+        "grant_items@105"
+      ],
+      "category": "other",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-tree-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/BossRushQuestReward.py::handle": {
@@ -84,21 +84,21 @@
     "of-ps/handlers/ChallengeStateUpdate.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@55"
+        "grant_items@163"
       ],
       "category": "other",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "server-run-id-claim-plus-packet-operation",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/CharacterStarUp.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@47"
+        "grant_items@104"
       ],
       "category": "character",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-character-growth",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/ClaimQuestReward.py::_handle": {
@@ -115,27 +115,27 @@
     "of-ps/handlers/CollectCoin.py::_handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@50"
+        "grant_items@77"
       ],
-      "category": "collection",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "dungeon",
+      "idempotency": "persistent-dungeon-coin-state-plus-packet-operation",
+      "transaction": "player-lock-dungeon-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/CollectMoon.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@53"
+        "grant_items@84"
       ],
       "category": "collection",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-collected-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/Collecting.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@76"
+        "grant_items@90"
       ],
       "category": "collection",
       "idempotency": "persistent-state-check",
@@ -145,7 +145,7 @@
     "of-ps/handlers/CollectionReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@96"
+        "grant_items@88"
       ],
       "category": "collection",
       "idempotency": "claimed-rewards-ledger",
@@ -165,7 +165,7 @@
     "of-ps/handlers/DailyTaskExchange.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@89"
+        "grant_items@88"
       ],
       "category": "other",
       "idempotency": "persistent-state-check",
@@ -195,12 +195,12 @@
     "of-ps/handlers/DungeonSweep.py::_handle": {
       "callCount": 2,
       "calls": [
-        "grant_items@109",
-        "pickup_rewards@105"
+        "pickup_rewards@156",
+        "grant_items@164"
       ],
       "category": "dungeon",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-finish-count",
+      "transaction": "player-lock-dungeon-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/DungeonTaskFinishReward.py::_handle": {
@@ -216,17 +216,17 @@
     "of-ps/handlers/EquipDisassemble.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@80"
+        "grant_items@131"
       ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-instance-removal",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/ExploreCollectReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@38"
+        "grant_items@44"
       ],
       "category": "collection",
       "idempotency": "in-memory-lock-only",
@@ -236,7 +236,7 @@
     "of-ps/handlers/ExploreReward.py::_claim_activity": {
       "callCount": 1,
       "calls": [
-        "grant_items@66"
+        "grant_items@72"
       ],
       "category": "activity",
       "idempotency": "persistent-state-check",
@@ -246,7 +246,7 @@
     "of-ps/handlers/ExploreReward.py::_claim_area": {
       "callCount": 1,
       "calls": [
-        "grant_items@108"
+        "grant_items@118"
       ],
       "category": "reward",
       "idempotency": "in-memory-lock-only",
@@ -288,23 +288,23 @@
     "of-ps/handlers/FlagBattleStateUpdate.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@89"
+        "grant_items@182"
       ],
-      "category": "other",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "category": "reward",
+      "idempotency": "server-run-id-claim-plus-packet-operation",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/Gacha.py::_grant": {
       "callCount": 3,
       "calls": [
-        "grant_character@161",
-        "grant_items@166",
-        "grant_single_item@170"
+        "grant_character@192",
+        "grant_items@197",
+        "grant_single_item@201"
       ],
       "category": "gacha",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-packet-operation-plus-atomic-gacha-state",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/GachaFullPick.py::handle": {
@@ -321,7 +321,7 @@
     "of-ps/handlers/Gather.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@89"
+        "grant_items@164"
       ],
       "category": "collection",
       "idempotency": "persistent-state-check",
@@ -331,7 +331,7 @@
     "of-ps/handlers/GetAchieveGroupAward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@52"
+        "grant_items@90"
       ],
       "category": "other",
       "idempotency": "claimed-rewards-ledger",
@@ -341,7 +341,7 @@
     "of-ps/handlers/GetCharacterAchievementAward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@87"
+        "grant_items@99"
       ],
       "category": "character",
       "idempotency": "claimed-rewards-ledger",
@@ -351,7 +351,7 @@
     "of-ps/handlers/GetCharacterAchievementBadgeAward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@76"
+        "grant_items@88"
       ],
       "category": "character",
       "idempotency": "claimed-rewards-ledger",
@@ -361,7 +361,7 @@
     "of-ps/handlers/GetLifeAchievementReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@52"
+        "grant_items@61"
       ],
       "category": "reward",
       "idempotency": "claimed-rewards-ledger",
@@ -371,7 +371,7 @@
     "of-ps/handlers/GetOneAchieveAward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@80"
+        "grant_items@73"
       ],
       "category": "other",
       "idempotency": "claimed-rewards-ledger",
@@ -399,14 +399,14 @@
       "transaction": "sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/handlers/InheritCodeUse.py::handle": {
+    "of-ps/handlers/Handicraft.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_rewards@52"
+        "grant_items@130"
       ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-material-consumption",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/IntervalReward.py::handle": {
@@ -422,27 +422,37 @@
     "of-ps/handlers/ItemSweep.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@91"
+        "grant_items@144"
       ],
       "category": "item",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-vitality-cost",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/ItemUse.py::_handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@140"
+        "grant_items@144"
       ],
       "category": "item",
       "idempotency": "persistent-state-check",
       "transaction": "sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
+    "of-ps/handlers/MakeProp.py::handle": {
+      "callCount": 1,
+      "calls": [
+        "grant_items@146"
+      ],
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-material-consumption",
+      "transaction": "player-lock-and-sqlite-transaction",
+      "durability": "sqlite-wal-full"
+    },
     "of-ps/handlers/ManualFlagReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@61"
+        "grant_items@71"
       ],
       "category": "reward",
       "idempotency": "claimed-rewards-ledger",
@@ -452,7 +462,7 @@
     "of-ps/handlers/MonsterDead.py::_handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@110"
+        "grant_items@215"
       ],
       "category": "other",
       "idempotency": "persistent-state-check",
@@ -462,17 +472,17 @@
     "of-ps/handlers/PetDecompose.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@79"
+        "grant_items@117"
       ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-instance-removal",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/Pickup.py::_pickup": {
       "callCount": 1,
       "calls": [
-        "pickup_rewards@55"
+        "pickup_rewards@116"
       ],
       "category": "pickup",
       "idempotency": "claimed-rewards-ledger",
@@ -482,17 +492,17 @@
     "of-ps/handlers/PlayerAbilityLevelUp.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@101"
+        "grant_items@151"
       ],
       "category": "other",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-ability-level",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/PlayerLevelReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@44"
+        "grant_items@79"
       ],
       "category": "reward",
       "idempotency": "claimed-rewards-ledger",
@@ -509,64 +519,64 @@
       "transaction": "item-manager-transaction-only",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/handlers/RecallCodeUse.py::handle": {
-      "callCount": 1,
-      "calls": [
-        "grant_rewards@51"
-      ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
-      "durability": "sqlite-wal-full"
-    },
     "of-ps/handlers/RestaurantGameOperate.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@139"
+        "grant_items@213"
       ],
       "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-restaurant-grid",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/RestaurantGameQuestReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@78"
+        "grant_items@137"
       ],
       "category": "quest",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-quest-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/RiddleStateUpdate.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@87"
+        "grant_items@158"
       ],
-      "category": "other",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "category": "reward",
+      "idempotency": "server-run-id-claim-plus-packet-operation",
+      "transaction": "player-lock-and-sqlite-transaction",
+      "durability": "sqlite-wal-full"
+    },
+    "of-ps/handlers/Sewing.py::handle": {
+      "callCount": 1,
+      "calls": [
+        "grant_items@131"
+      ],
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-material-consumption",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/ShopBuy.py::_purchase": {
       "callCount": 1,
       "calls": [
-        "grant_items@163"
+        "grant_items@192"
       ],
       "category": "shop",
-      "idempotency": "persistent-state-check",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "packet-fingerprint-operation-plus-persistent-purchase-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/TakeOutFurniture.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@58"
+        "grant_items@112"
       ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "item",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-furniture-removal",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/TreasureBoxPickup.py::_pickup": {
@@ -582,7 +592,7 @@
     "of-ps/handlers/TreasureDig.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@88"
+        "grant_items@110"
       ],
       "category": "other",
       "idempotency": "persistent-state-check",
@@ -592,31 +602,31 @@
     "of-ps/handlers/TreasureIllustrationReward.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_items@103"
+        "grant_items@137"
       ],
       "category": "reward",
       "idempotency": "claimed-rewards-ledger",
       "transaction": "item-manager-transaction-only",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/handlers/Tutorial.py::_tutorial": {
+    "of-ps/handlers/Tutorial.py::_apply_tutorial": {
       "callCount": 1,
       "calls": [
-        "grant_items@64"
+        "grant_items@104"
       ],
-      "category": "other",
-      "idempotency": "claimed-rewards-ledger",
-      "transaction": "item-manager-transaction-only",
+      "category": "quest",
+      "idempotency": "packet-fingerprint-operation-plus-tutorial-claim",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/handlers/WishListBuy.py::handle": {
       "callCount": 1,
       "calls": [
-        "grant_single_item@106"
+        "grant_items@239"
       ],
-      "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "category": "shop",
+      "idempotency": "packet-fingerprint-operation-plus-atomic-wish-removal",
+      "transaction": "sorted-player-locks-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/server/activities.py::_claim_quest_progress": {
@@ -733,51 +743,43 @@
     "of-ps/server/mail_rewards.py::_grant_prepared": {
       "callCount": 1,
       "calls": [
-        "grant_items@89"
+        "grant_items@203"
       ],
       "category": "mail",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-mail-claim-ledger-and-attachment-clear",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/server/minigames.py::_grant": {
       "callCount": 1,
       "calls": [
-        "grant_items@153"
+        "grant_items@155"
       ],
       "category": "other",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-settled-run-and-reward-results",
+      "transaction": "caller-player-locks-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
-    "of-ps/server/redemption.py::claim_invite_reward": {
+    "of-ps/server/redemption.py::_redeem_code_locked": {
       "callCount": 1,
       "calls": [
-        "grant_rewards@300"
+        "grant_rewards@244"
+      ],
+      "category": "other",
+      "idempotency": "redeem-code-use-ledger-plus-packet-operation",
+      "transaction": "player-lock-and-sqlite-transaction",
+      "durability": "sqlite-wal-full"
+    },
+    "of-ps/server/redemption.py::apply": {
+      "callCount": 3,
+      "calls": [
+        "grant_rewards@173",
+        "grant_rewards@384",
+        "grant_rewards@437"
       ],
       "category": "reward",
-      "idempotency": "claimed-rewards-ledger",
-      "transaction": "sqlite-transaction",
-      "durability": "sqlite-wal-full"
-    },
-    "of-ps/server/redemption.py::redeem_code": {
-      "callCount": 1,
-      "calls": [
-        "grant_rewards@144"
-      ],
-      "category": "other",
-      "idempotency": "in-memory-lock-only",
-      "transaction": "sqlite-transaction",
-      "durability": "sqlite-wal-full"
-    },
-    "of-ps/server/redemption.py::use_invite_code": {
-      "callCount": 1,
-      "calls": [
-        "grant_rewards@252"
-      ],
-      "category": "other",
-      "idempotency": "persistent-state-check",
-      "transaction": "sqlite-transaction",
+      "idempotency": "packet-fingerprint-operation-plus-claim-or-invite-state",
+      "transaction": "player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/achieve_award.py::grant_items": {
@@ -786,18 +788,18 @@
         "grant_items@34"
       ],
       "category": "item",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "no-production-callers",
+      "transaction": "not-applicable-no-production-callers",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/db.py::grant_rewards": {
       "callCount": 1,
       "calls": [
-        "grant_items@2071"
+        "grant_items@2075"
       ],
       "category": "reward",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-claim-or-redemption-state",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/dungeon_reward.py::grant_items": {
@@ -806,8 +808,8 @@
         "grant_items@152"
       ],
       "category": "reward",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "no-production-callers",
+      "transaction": "not-applicable-no-production-callers",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/dungeon_reward.py::grant_stack_item": {
@@ -816,8 +818,8 @@
         "grant_items@144"
       ],
       "category": "reward",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "no-production-callers",
+      "transaction": "not-applicable-no-production-callers",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/garden_state.py::grant_stack_item": {
@@ -826,26 +828,26 @@
         "grant_items@201"
       ],
       "category": "item",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-persistent-garden-state",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/item_mgr.py::grant_character": {
       "callCount": 1,
       "calls": [
-        "grant_single_item@234"
+        "grant_single_item@268"
       ],
       "category": "item",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-gacha-operation-or-full-pick-claim",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/item_mgr.py::grant_items": {
       "callCount": 3,
       "calls": [
-        "grant_character@454",
-        "grant_single_item@463",
-        "grant_single_item@474"
+        "grant_character@488",
+        "grant_single_item@497",
+        "grant_single_item@508"
       ],
       "category": "item",
       "idempotency": "persistent-state-check",
@@ -855,12 +857,12 @@
     "of-ps/utils/item_mgr.py::pickup_rewards": {
       "callCount": 2,
       "calls": [
-        "grant_items@576",
-        "grant_items@585"
+        "grant_items@669",
+        "grant_items@679"
       ],
       "category": "pickup",
-      "idempotency": "none-declared",
-      "transaction": "item-manager-transaction-only",
+      "idempotency": "caller-drop-box-or-sweep-operation",
+      "transaction": "caller-player-lock-and-sqlite-transaction",
       "durability": "sqlite-wal-full"
     },
     "of-ps/utils/quest_track.py::_advance_into": {

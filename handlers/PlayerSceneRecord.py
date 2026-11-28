@@ -10,6 +10,9 @@ class Handler(PacketHandler):
     def handle(self, session, data: bytes, packet_id: int):
         req = PlayerSceneRecordReq()
         req.ParseFromString(data)
+        rate_limiter = getattr(session, "rate_limiter", None)
+        if rate_limiter is not None and not rate_limiter.allow("position"):
+            return
 
         with shared_projection.store.locked():
             shared_projection.store.update_from_recorder(

@@ -1,3 +1,5 @@
+import logging
+
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
 
@@ -7,12 +9,25 @@ from proto.net_pb2 import (
     StatusCode,
     PackNotice,
 )
-import utils.db as db
+from server import redemption
+
+logger = logging.getLogger(__name__)
 
 """
 # 使用继承码 3001 3002
 继承码用于跨渠道/换端继承账号奖励, 码库由 GM 写入 db.redeem_codes(code_type='inherit')。
 """
+
+_STATUS_MAP = {
+    0: StatusCode.StatusCode_OK,
+    1: StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST,
+    2: StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST,
+    3: StatusCode.StatusCode_REDEMPTION_CODE_NUM_IS_MAX,
+    4: StatusCode.StatusCode_REDEMPTION_CODE_USED,
+    5: StatusCode.StatusCode_REDEMPTION_CODE_FAIL,
+    6: StatusCode.StatusCode_REDEMPTION_CODE_FAIL,
+    "conflict": StatusCode.StatusCode_BAD_REQ,
+}
 
 
 @packet_handler(MsgId.InheritCodeUseReq)
@@ -21,35 +36,30 @@ class Handler(PacketHandler):
         req = InheritCodeUseReq()
         req.ParseFromString(data)
 
-        rsp = InheritCodeUseRsp()
-        rsp.code_str = req.code
-
-        status, rewards_str = db.use_redeem_code(
-            session.player_id, req.code, code_type="inherit"
+        rsp = InheritCodeUseRsp(
+            status=StatusCode.StatusCode_OK, code_str=req.code
         )
-        if status != 0:
-            rsp.status = StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST
-            session.send(MsgId.InheritCodeUseRsp, rsp, packet_id)  # 3001,3002
+        pack = PackNotice(status=StatusCode.StatusCode_OK)
+        try:
+            status, _rewards = redemption.redeem_code(
+                session.player_id,
+                req.code,
+                rsp.rewards,
+                pack,
+                code_type="inherit",
+                packet_id=packet_id,
+                response=rsp,
+            )
+        except Exception:
+            # The transaction rolls back the code counter/use marker and grant.
+            logger.exception("Inherit-code fulfillment failed")
+            rsp.Clear()
+            rsp.code_str = req.code
+            rsp.status = StatusCode.StatusCode_SYS_ERR
+            session.send(MsgId.InheritCodeUseRsp, rsp, packet_id)
             return
 
-        reward_list = []
-        for pair in rewards_str.split(","):
-            pair = pair.strip()
-            if ":" not in pair:
-                continue
-            item_id_str, num_str = pair.split(":", 1)
-            if not (item_id_str.strip().isdigit() and num_str.strip().isdigit()):
-                continue
-            item_id = int(item_id_str)
-            num = int(num_str)
-            if item_id and num > 0:
-                reward_list.append((item_id, num))
-
-        rsp.status = StatusCode.StatusCode_OK
-        if reward_list:
-            pack = PackNotice()
-            pack.status = StatusCode.StatusCode_OK
-            db.grant_rewards(session.player_id, reward_list, rsp.rewards, pack)
+        rsp.status = _STATUS_MAP.get(status, StatusCode.StatusCode_SYS_ERR)
+        session.send(MsgId.InheritCodeUseRsp, rsp, packet_id)
+        if status == 0 and pack.items:
             session.send(MsgId.PackNotice, pack, 0)
-
-        session.send(MsgId.InheritCodeUseRsp, rsp, packet_id)  # 3001,3002

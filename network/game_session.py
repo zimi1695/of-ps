@@ -14,7 +14,7 @@ from network.msg_id import MsgId
 from network.packet_factory import PacketFactory
 from proto.net_pb2 import PacketHead, PosColor, ScenePlayer
 from server import lobby_state
-from utils import metrics as metrics_registry
+from utils import event_trace, metrics as metrics_registry
 from utils.rate_limit import SessionRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -49,13 +49,24 @@ def _snappy_uncompressed_length(data):
 
 
 class SendTask:
-    __slots__ = ("msg_id", "data", "packet_id", "is_bin")
+    __slots__ = (
+        "msg_id",
+        "data",
+        "packet_id",
+        "is_bin",
+        "trace_id",
+        "produced_at_us",
+        "queued_at_ns",
+    )
 
-    def __init__(self, msg_id, data, packet_id, is_bin):
+    def __init__(self, msg_id, data, packet_id, is_bin, trace=None):
         self.msg_id = msg_id
         self.data = data
         self.packet_id = packet_id
         self.is_bin = is_bin
+        self.trace_id = trace.trace_id if trace else 0
+        self.produced_at_us = trace.produced_at_us if trace else 0
+        self.queued_at_ns = time.perf_counter_ns()
 
 
 class GameSession:
@@ -104,6 +115,11 @@ class GameSession:
         "scene_announced",
         "remote",
         "rate_limiter",
+        "session_generation",
+        "_event_seq",
+        "_event_seq_lock",
+        "_incoming_trace_id",
+        "_incoming_produced_at_us",
     )
 
     HEADER_LENGTH = 2
@@ -155,6 +171,11 @@ class GameSession:
 
         self._write_head_buf = bytearray(128)
         self._seq_id = 1
+        self.session_generation = event_trace.new_trace().trace_id
+        self._event_seq = 0
+        self._event_seq_lock = Lock()
+        self._incoming_trace_id = 0
+        self._incoming_produced_at_us = 0
 
         self.player_id = 0
         self.player_name = ""
@@ -194,6 +215,10 @@ class GameSession:
                 "emoji": (
                     Config.EMOJI_RATE_LIMIT_PER_SEC,
                     Config.EMOJI_RATE_LIMIT_BURST,
+                ),
+                "position": (
+                    Config.POSITION_RATE_LIMIT_PER_SEC,
+                    Config.POSITION_RATE_LIMIT_BURST,
                 ),
             }
         )
@@ -349,6 +374,9 @@ class GameSession:
             elif len(body) > self.MAX_MESSAGE_BYTES:
                 raise _ProtocolError("body exceeds receive limit")
 
+            self._incoming_trace_id = head.trace_id
+            self._incoming_produced_at_us = head.produced_at_us
+            event_trace.record_receive(head.trace_id, head.produced_at_us)
             if head.msg_id not in Config.DEBUG_PACKET_PASS:
                 logger.debug("Received message: %s", id_to_name.get(head.msg_id))
 
@@ -378,6 +406,11 @@ class GameSession:
                 self._recv_buf[:rem] = self._recv_buf[pos:end]
             self._recv_len = rem
 
+    def next_event_seq(self):
+        with self._event_seq_lock:
+            self._event_seq += 1
+            return self._event_seq
+
     def send(self, msg_id: int, message: Message, packet_id: int, is_bin: bool = False):
         if msg_id not in Config.DEBUG_PACKET_PASS:
             logger.debug("Sending message: %s", id_to_name.get(msg_id))
@@ -390,7 +423,13 @@ class GameSession:
             logger.warning("Outgoing message %s exceeds size limit", msg_id)
             return False
 
-        task = SendTask(msg_id, data_bytes, packet_id, is_bin)
+        trace = event_trace.current()
+        task = SendTask(msg_id, data_bytes, packet_id, is_bin, trace)
+        if trace:
+            metrics_registry.metrics.observe(
+                "ofps.trace.produced_to_queue_seconds",
+                (task.queued_at_ns / 1_000_000_000 - trace.produced_at_us / 1_000_000),
+            )
         overflow = False
         bulk = msg_id == MsgId.PlayerSceneSyncDataNotice
         with self._send_lock:
@@ -430,6 +469,10 @@ class GameSession:
             logger.warning("Send queue overflow: %s", self.address)
             self.close()
             return False
+        metrics_registry.metrics.inc("ofps.network.recipient_messages_total")
+        metrics_registry.metrics.inc(
+            "ofps.network.recipient_bytes_total", len(data_bytes)
+        )
         return True
 
     def _send_loop(self):
@@ -504,6 +547,8 @@ class GameSession:
                     head_proto.packet_id = task.packet_id
                 head_proto.flag = flag
                 head_proto.body_len = body_len
+                head_proto.trace_id = task.trace_id
+                head_proto.produced_at_us = task.produced_at_us
                 if task.msg_id in _NOSEQ_CMDS:
                     head_proto.seq_id = 0
                 else:
@@ -532,8 +577,18 @@ class GameSession:
                 current_offset += total_pkt_len
 
             if current_offset > 0 and self.running:
+                send_started_ns = time.perf_counter_ns()
                 try:
                     sock.sendall(memoryview(out_buf)[:current_offset])
+                    send_seconds = (time.perf_counter_ns() - send_started_ns) / 1e9
+                    for task in tasks:
+                        metrics_registry.metrics.observe(
+                            "ofps.trace.queue_seconds",
+                            (send_started_ns - task.queued_at_ns) / 1e9,
+                        )
+                        metrics_registry.metrics.observe(
+                            "ofps.trace.send_seconds", send_seconds
+                        )
                     metrics_registry.metrics.inc(
                         "ofps.network.bytes_sent_total", current_offset
                     )

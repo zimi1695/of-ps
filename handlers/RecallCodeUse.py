@@ -1,3 +1,5 @@
+import logging
+
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
 
@@ -7,12 +9,25 @@ from proto.net_pb2 import (
     StatusCode,
     PackNotice,
 )
-import utils.db as db
+from server import redemption
+
+logger = logging.getLogger(__name__)
 
 """
 # 使用回归召回码 4513 4514
 老玩家把召回码发给回归玩家(或反之)兑换奖励, 码库由 GM 写入 db.redeem_codes(code_type='recall')。
 """
+
+_STATUS_MAP = {
+    0: StatusCode.StatusCode_OK,
+    1: StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST,
+    2: StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST,
+    3: StatusCode.StatusCode_REDEMPTION_CODE_NUM_IS_MAX,
+    4: StatusCode.StatusCode_REDEMPTION_CODE_USED,
+    5: StatusCode.StatusCode_REDEMPTION_CODE_FAIL,
+    6: StatusCode.StatusCode_REDEMPTION_CODE_FAIL,
+    "conflict": StatusCode.StatusCode_BAD_REQ,
+}
 
 
 @packet_handler(MsgId.RecallCodeUseReq)
@@ -21,34 +36,27 @@ class Handler(PacketHandler):
         req = RecallCodeUseReq()
         req.ParseFromString(data)
 
-        rsp = RecallCodeUseRsp()
-
-        status, rewards_str = db.use_redeem_code(
-            session.player_id, req.code, code_type="recall"
-        )
-        if status != 0:
-            rsp.status = StatusCode.StatusCode_REDEMPTION_CODE_NOT_EXIST
-            session.send(MsgId.RecallCodeUseRsp, rsp, packet_id)  # 4513,4514
+        rsp = RecallCodeUseRsp(status=StatusCode.StatusCode_OK)
+        pack = PackNotice(status=StatusCode.StatusCode_OK)
+        try:
+            status, _rewards = redemption.redeem_code(
+                session.player_id,
+                req.code,
+                rsp.rewards,
+                pack,
+                code_type="recall",
+                packet_id=packet_id,
+                response=rsp,
+            )
+        except Exception:
+            # The transaction rolls back the code counter/use marker and grant.
+            logger.exception("Recall-code fulfillment failed")
+            rsp.Clear()
+            rsp.status = StatusCode.StatusCode_SYS_ERR
+            session.send(MsgId.RecallCodeUseRsp, rsp, packet_id)
             return
 
-        reward_list = []
-        for pair in rewards_str.split(","):
-            pair = pair.strip()
-            if ":" not in pair:
-                continue
-            item_id_str, num_str = pair.split(":", 1)
-            if not (item_id_str.isdigit() and num_str.isdigit()):
-                continue
-            item_id = int(item_id_str)
-            num = int(num_str)
-            if item_id and num > 0:
-                reward_list.append((item_id, num))
-
-        rsp.status = StatusCode.StatusCode_OK
-        if reward_list:
-            pack = PackNotice()
-            pack.status = StatusCode.StatusCode_OK
-            db.grant_rewards(session.player_id, reward_list, rsp.rewards, pack)
+        rsp.status = _STATUS_MAP.get(status, StatusCode.StatusCode_SYS_ERR)
+        session.send(MsgId.RecallCodeUseRsp, rsp, packet_id)
+        if status == 0 and pack.items:
             session.send(MsgId.PackNotice, pack, 0)
-
-        session.send(MsgId.RecallCodeUseRsp, rsp, packet_id)  # 4513,4514

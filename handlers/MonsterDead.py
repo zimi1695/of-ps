@@ -10,8 +10,10 @@ from proto.net_pb2 import (
     MoonQuestGamePlayRewardNotice,
 )
 import random
+import logging
 
 import utils.db as db
+from server import entity_authority
 from utils.pb_create import make_item, _scene_types
 from utils.res_loader import res
 from utils.reward_resolver import resolve_drop, resolve_reward
@@ -19,6 +21,15 @@ from utils import achieve_track, item_mgr
 from utils import monster_loot
 from utils import dungeon_state
 from config import Config
+
+logger = logging.getLogger(__name__)
+
+
+def _release_ownership(authority, domain, entity_id):
+    try:
+        authority.release(domain, entity_id)
+    except Exception:
+        logger.warning("Unable to release monster ownership", exc_info=True)
 
 
 def _monster_config(monster_id):
@@ -97,17 +108,45 @@ class Handler(PacketHandler):
             rsp.status = StatusCode.StatusCode_FAIL
             session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
             return
+        authority = entity_authority.active()
+        entity_id = req.monster_index or req.monster_id
+        ownership_domain = (
+            entity_authority.entity_domain(
+                "monster",
+                session.scene_id,
+                session.channel_id,
+                session.player_id if session.dungeon[0] else None,
+            )
+            + f":{req.monster_id}"
+        )
+        if authority is None:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
+            return
+        try:
+            authority.assert_owner(
+                ownership_domain,
+                entity_id,
+                require_shared=Config.LINK_OTHER_SERVER,
+            )
+        except entity_authority.OwnershipError:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
+            return
 
         # 副本点位必须使用服务端配置的怪物, 防止同一点位替换成首领奖励池。
         if session.dungeon[0]:
             expected_id = _dungeon_monster_id(session, req.monster_index)
             if expected_id is not None and expected_id != req.monster_id:
+                _release_ownership(authority, ownership_domain, entity_id)
                 rsp.status = StatusCode.StatusCode_FAIL
                 session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
                 return
             if expected_id is None and _monster_tag(req.monster_id) == 3:
+                _release_ownership(authority, ownership_domain, entity_id)
                 rsp.status = StatusCode.StatusCode_FAIL
                 session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
+                return
 
         claim_key = (
             f"{session.scene_id}:{session.dungeon[0]}:{token}:"
@@ -117,7 +156,13 @@ class Handler(PacketHandler):
         player_level = db.get_players_info(session.player_id, "level")[0]
         reward_id = _monster_reward_id(req.monster_id)
         reward_list = resolve_drop(reward_id, world_level, player_level) if reward_id else []
-        item_mgr.validate_rewards(reward_list)
+        try:
+            item_mgr.validate_rewards(reward_list)
+        except item_mgr.EconomyConfigError:
+            _release_ownership(authority, ownership_domain, entity_id)
+            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+            session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
+            return
 
         notice = PackNotice(status=StatusCode.StatusCode_OK)
         moon_notice = None
@@ -186,6 +231,12 @@ class Handler(PacketHandler):
         if staged_drops is not None and rsp.status == StatusCode.StatusCode_OK:
             with session.drop_lock:
                 session.drop_items[drop_index] = staged_drops
+        if rsp.status in (
+            StatusCode.StatusCode_OK,
+            StatusCode.StatusCode_REPEAT_GET_REWARD,
+            StatusCode.StatusCode_CFG_NOT_FOUND,
+        ):
+            _release_ownership(authority, ownership_domain, entity_id)
         session.send(MsgId.MonsterDeadRsp, rsp, packet_id)
         if rsp.status != StatusCode.StatusCode_OK:
             return

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import socket
@@ -8,7 +9,15 @@ from threading import Event, Lock, Thread, current_thread
 from config import Config
 from network.game_session import GameSession
 from network.packet_factory import PacketFactory
-from server import lobby_state, shared_projection
+from server import (
+    entity_authority,
+    entity_store,
+    etcd_authority,
+    lobby_state,
+    replicated_events,
+    replicated_roster,
+    shared_projection,
+)
 from server.scene_data import _session_list as session_list, lock_session, remove_recorder
 import server.notice_sync as notice_sync
 
@@ -39,6 +48,11 @@ class GameServer:
         self.lease = lobby_state.LobbyHostLease(
             self.host_id, self.epoch, Config.LOBBY_LEASE_SECONDS
         )
+        self.authority = None
+        self.authority_credential = None
+        self.event_log = None
+        self.roster_replicator = None
+        self._snapshot_writes_allowed = True
 
     def start(self):
         """Bind and serve until stop() is called.  Instances are single-use."""
@@ -47,21 +61,98 @@ class GameServer:
                 if self._started.is_set() or self._stopped.is_set():
                     raise RuntimeError("GameServer instance cannot be started twice")
                 PacketFactory.initialize_handlers(Config.HANDLERS_PACKAGE)
-                if Config.LOBBY_STATE_PATH:
-                    saved = lobby_state.load_lobby_state(Config.LOBBY_STATE_PATH)
-                    if saved is not None:
-                        lobby_state.restore_lobby_state(saved, current_epoch=0)
-                        self.epoch = int(saved["epoch"]) + 1
-                        self.lease = lobby_state.LobbyHostLease(
-                            self.host_id,
-                            self.epoch,
-                            Config.LOBBY_LEASE_SECONDS,
+                if Config.LOBBY_ETCD_ENDPOINT:
+                    self._snapshot_writes_allowed = False
+                    client = etcd_authority.EtcdClient(
+                        Config.LOBBY_ETCD_ENDPOINT,
+                        ca_cert=Config.LOBBY_ETCD_CA_CERT,
+                        cert=Config.LOBBY_ETCD_CERT,
+                        key=Config.LOBBY_ETCD_KEY,
+                        username=Config.LOBBY_ETCD_USERNAME,
+                        password=Config.LOBBY_ETCD_PASSWORD,
+                    )
+                    self.authority = etcd_authority.ChannelAuthority(
+                        client, lease_seconds=Config.LOBBY_LEASE_SECONDS
+                    )
+                    self.authority_credential = self.authority.acquire(
+                        Config.LOBBY_CHANNEL_ID,
+                        self.host_id,
+                        Config.LOBBY_CONFIG_GENERATION,
+                    )
+                    self.authority_credential = self.authority.commit_noop(
+                        self.authority_credential
+                    )
+                    self.epoch = self.authority_credential.app_term
+                    self.lease = lobby_state.LobbyHostLease(
+                        self.host_id, self.epoch, Config.LOBBY_LEASE_SECONDS
+                    )
+                    snapshot_data = self.authority.load_snapshot(
+                        self.authority_credential.channel_id
+                    )
+                    snapshot_source = "etcd"
+                    if snapshot_data is None and Config.LOBBY_STATE_PATH:
+                        saved = lobby_state.load_lobby_state(Config.LOBBY_STATE_PATH)
+                        if saved is not None:
+                            snapshot_data = saved
+                            snapshot_source = Config.LOBBY_STATE_PATH
+                    if snapshot_data is None:
+                        shared_projection.store.set_authority(
+                            Config.LOBBY_CONFIG_GENERATION, self.epoch
+                        )
+                    else:
+                        if isinstance(snapshot_data, (bytes, bytearray)):
+                            try:
+                                snapshot_data = json.loads(snapshot_data)
+                            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                                raise lobby_state.LobbyStateError(
+                                    "etcd lobby snapshot encoding is invalid"
+                                ) from error
+                        restored_epoch = self._restore_recovery_state(
+                            snapshot_data, self.authority_credential
                         )
                         logger.info(
-                            "Restored lobby snapshot from %s at epoch %s",
-                            Config.LOBBY_STATE_PATH,
+                            "Restored lobby snapshot from %s at data epoch %s "
+                            "under authority epoch %s",
+                            snapshot_source,
+                            restored_epoch,
                             self.epoch,
                         )
+                    self._snapshot_writes_allowed = True
+                    owner = entity_authority.active()
+                    if owner is not None:
+                        owner.configure_store(
+                            entity_store.EntityOwnershipStore(
+                                client, Config.LOBBY_CHANNEL_ID
+                            ),
+                            lambda: self.authority_credential,
+                        )
+                    self.event_log = replicated_events.ReplicatedEventLog(
+                        self.authority, lambda: self.authority_credential
+                    )
+                    replicated_events.activate(self.event_log)
+                    self.roster_replicator = replicated_roster.RosterReplicator(
+                        self.authority,
+                        lambda: self.authority_credential,
+                        paused=Config.LINK_OTHER_SERVER,
+                    )
+                    replicated_roster.activate(self.roster_replicator)
+                else:
+                    if Config.LOBBY_STATE_PATH:
+                        saved = lobby_state.load_lobby_state(Config.LOBBY_STATE_PATH)
+                        if saved is not None:
+                            lobby_state.restore_lobby_state(saved, current_epoch=0)
+                            self.epoch = int(saved["epoch"]) + 1
+                            self.lease = lobby_state.LobbyHostLease(
+                                self.host_id,
+                                self.epoch,
+                                Config.LOBBY_LEASE_SECONDS,
+                            )
+                            logger.info(
+                                "Restored lobby snapshot from %s at epoch %s",
+                                Config.LOBBY_STATE_PATH,
+                                self.epoch,
+                            )
+                    shared_projection.store.set_authority(1, self.epoch)
                 lobby_state.activate_host_lease(self.lease)
                 self._discard_stale_sessions()
 
@@ -155,6 +246,39 @@ class GameServer:
             if not self.running and not self._stopped.is_set():
                 self.stop()
 
+    @staticmethod
+    def _restore_recovery_state(state, credential):
+        state = lobby_state.validate_lobby_state(state)
+        if state.get("channel_id") != credential.channel_id:
+            raise lobby_state.LobbyStateError(
+                "lobby snapshot channel does not match channel authority"
+            )
+        if state.get("config_generation", 1) != credential.config_generation:
+            raise lobby_state.LobbyStateError(
+                "lobby snapshot config generation does not match channel authority"
+            )
+        current = shared_projection.store.roster_metadata()
+        if (
+            current["config_generation"] > credential.config_generation
+            or current["authority_epoch"] > credential.app_term
+        ):
+            raise lobby_state.LobbyStateError(
+                "lobby snapshot would move channel authority backwards"
+            )
+        if (
+            state["epoch"] > credential.app_term
+            or state.get("authority_epoch", state["epoch"]) > credential.app_term
+        ):
+            raise lobby_state.LobbyStateError(
+                "lobby snapshot is newer than channel authority"
+            )
+        lobby_state.restore_lobby_state(
+            state,
+            current_epoch=0,
+            authority_epoch=credential.app_term,
+        )
+        return state["epoch"]
+
     def _maintenance_loop(self):
         interval = min(
             Config.LOBBY_LEASE_SECONDS / 3.0,
@@ -162,6 +286,10 @@ class GameServer:
         )
         while not self._maintenance_stop.wait(interval):
             try:
+                if self.authority is not None:
+                    self.authority_credential = self.authority.renew(
+                        self.authority_credential
+                    )
                 self.lease.renew()
             except Exception:
                 logger.exception("Lobby host lease renewal failed")
@@ -181,10 +309,20 @@ class GameServer:
                             projection.channel_id,
                             projection.player_id,
                         )
+                    snapshot = lobby_state.capture_lobby_state(
+                        self.host_id, self.epoch, Config.LOBBY_CHANNEL_ID
+                    )
                     lobby_state.persist_lobby_state(
                         Config.LOBBY_STATE_PATH,
-                        lobby_state.capture_lobby_state(self.host_id, self.epoch),
+                        snapshot,
                     )
+                    if self.authority is not None:
+                        self.authority.commit_snapshot(
+                            self.authority_credential,
+                            json.dumps(
+                                snapshot, ensure_ascii=False, separators=(",", ":")
+                            ).encode(),
+                        )
                     self._last_snapshot_at = time.monotonic()
                 except Exception:
                     logger.exception("Unable to persist periodic lobby snapshot")
@@ -232,12 +370,25 @@ class GameServer:
                 maintenance_thread.join()
             first_error = None
 
-            if Config.LOBBY_STATE_PATH:
+            if self._snapshot_writes_allowed and (
+                Config.LOBBY_STATE_PATH or self.authority is not None
+            ):
                 try:
-                    lobby_state.persist_lobby_state(
-                        Config.LOBBY_STATE_PATH,
-                        lobby_state.capture_lobby_state(self.host_id, self.epoch),
+                    snapshot = lobby_state.capture_lobby_state(
+                        self.host_id, self.epoch, Config.LOBBY_CHANNEL_ID
                     )
+                    if Config.LOBBY_STATE_PATH:
+                        lobby_state.persist_lobby_state(
+                            Config.LOBBY_STATE_PATH,
+                            snapshot,
+                        )
+                    if self.authority is not None:
+                        self.authority.commit_snapshot(
+                            self.authority_credential,
+                            json.dumps(
+                                snapshot, ensure_ascii=False, separators=(",", ":")
+                            ).encode(),
+                        )
                 except Exception as error:
                     first_error = error
                     logger.exception("Unable to persist lobby snapshot")
@@ -300,6 +451,21 @@ class GameServer:
                 self._stopped.set()
 
             lobby_state.deactivate_host_lease(self.lease)
+            if self.event_log is not None:
+                replicated_events.deactivate(self.event_log)
+            if self.roster_replicator is not None:
+                replicated_roster.deactivate(self.roster_replicator)
+            owner = entity_authority.active()
+            if owner is not None:
+                owner.configure_store(None, None)
+            if self.authority is not None and self.authority_credential is not None:
+                try:
+                    self.authority.release(self.authority_credential)
+                except Exception:
+                    first_error = first_error or RuntimeError(
+                        "Unable to release channel authority lease"
+                    )
+                    logger.exception("Unable to release channel authority lease")
             if first_error is not None:
                 raise RuntimeError("GameServer shutdown completed with errors") from first_error
 

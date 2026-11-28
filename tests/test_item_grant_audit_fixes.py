@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from config import Config
 from network.msg_id import MsgId
 from proto.net_pb2 import (
@@ -32,6 +33,7 @@ import handlers.GetOneAchieveAward as achieve
 import handlers.ItemSweep as item_sweep
 import handlers.MonsterDead as monster_dead
 import handlers.TreasureDig as treasure_dig
+from server import entity_authority
 import utils.db as db
 import utils.res_loader as res_loader
 from utils import item_mgr
@@ -68,6 +70,9 @@ def resources():
 
 @pytest.fixture(autouse=True)
 def game_db(tmp_path, monkeypatch):
+    authority = entity_authority.activate(
+        Config.LOBBY_HOST_ID, Ed25519PrivateKey.generate()
+    )
     old_path, old_memory = Config.DB_PATH, Config.IN_MEMORY
     Config.DB_PATH = str(tmp_path / "audit-fix.db")
     Config.IN_MEMORY = False
@@ -87,6 +92,7 @@ def game_db(tmp_path, monkeypatch):
     ):
         monkeypatch.setattr(item_mgr.achieve_track, name, lambda *args, **kwargs: 0)
     yield
+    entity_authority.deactivate(authority)
     db.exit()
     Config.DB_PATH, Config.IN_MEMORY = old_path, old_memory
 
@@ -126,8 +132,8 @@ def install_resources(patch, resources):
         patch.dict(res_loader.res, resources)
 
 
-def send(handler, session, request, response_id):
-    handler.Handler().handle(session, request.SerializeToString(), 1)
+def send(handler, session, request, response_id, packet_id=1):
+    handler.Handler().handle(session, request.SerializeToString(), packet_id)
     return session.response(response_id)
 
 
@@ -523,6 +529,47 @@ def test_of006_dungeon_cost_multiplication_overflow_is_rejected(monkeypatch):
     assert num(Config.VITALITY_ITEM_ID) == 100 and db.get_dungeon(1, 88001) is None
 
 
+def test_of006_dungeon_sweep_same_packet_replays_without_duplicate(monkeypatch):
+    grant(Config.VITALITY_ITEM_ID, 4)
+    session = FakeSession()
+    with monkeypatch.context() as patch:
+        install_resources(patch, {**res_loader.res, **_dungeon_resources()})
+        patch.setattr(dungeon_sweep, "resolve_drop", lambda *args: [(102, 2)])
+        first = send(dungeon_sweep, session, DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp, packet_id=7)
+        replay = send(dungeon_sweep, FakeSession(), DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp, packet_id=7)
+    assert first.SerializeToString() == replay.SerializeToString()
+    assert num(Config.VITALITY_ITEM_ID) == 2 and num(102) == 2
+    from proto.net_pb2 import DungeonData
+    assert DungeonData.FromString(db.get_dungeon(1, 88001)).finish_times == 1
+    assert db.get_kv(1, "activity_operations", "dungeon-sweep:0:7") is not None
+
+
+def test_of006_dungeon_sweep_same_packet_different_request_conflicts(monkeypatch):
+    grant(Config.VITALITY_ITEM_ID, 4)
+    with monkeypatch.context() as patch:
+        install_resources(patch, {**res_loader.res, **_dungeon_resources()})
+        patch.setattr(dungeon_sweep, "resolve_drop", lambda *args: [(102, 2)])
+        first = send(dungeon_sweep, FakeSession(), DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp, packet_id=8)
+        conflict = send(dungeon_sweep, FakeSession(), DungeonSweepReq(dungeon_id=88002), MsgId.DungeonSweepRsp, packet_id=8)
+    assert first.status == StatusCode.StatusCode_OK
+    assert conflict.status == StatusCode.StatusCode_BAD_REQ
+    assert num(Config.VITALITY_ITEM_ID) == 2 and num(102) == 2
+
+
+def test_of006_dungeon_sweep_zero_packet_id_remains_independent(monkeypatch):
+    grant(Config.VITALITY_ITEM_ID, 4)
+    with monkeypatch.context() as patch:
+        install_resources(patch, {**res_loader.res, **_dungeon_resources()})
+        patch.setattr(dungeon_sweep, "resolve_drop", lambda *args: [(102, 2)])
+        first = send(dungeon_sweep, FakeSession(), DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp, packet_id=0)
+        second = send(dungeon_sweep, FakeSession(), DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp, packet_id=0)
+    assert first.status == second.status == StatusCode.StatusCode_OK
+    assert num(Config.VITALITY_ITEM_ID) == 0 and num(102) == 4
+    from proto.net_pb2 import DungeonData
+    assert DungeonData.FromString(db.get_dungeon(1, 88001)).finish_times == 2
+    assert db.get_kv(1, "activity_operations", "dungeon-sweep:0:0") is None
+
+
 def test_of006_concurrent_dungeon_sweeps_do_not_lose_finish_count(monkeypatch):
     grant(Config.VITALITY_ITEM_ID, 16)
     sessions = [FakeSession() for _ in range(8)]
@@ -530,8 +577,14 @@ def test_of006_concurrent_dungeon_sweeps_do_not_lose_finish_count(monkeypatch):
         install_resources(patch, {**res_loader.res, **_dungeon_resources()})
         patch.setattr(dungeon_sweep, "resolve_drop", lambda *args: [(102, 2)])
         responses = concurrently([
-            (lambda s=s: send(dungeon_sweep, s, DungeonSweepReq(dungeon_id=88001), MsgId.DungeonSweepRsp))
-            for s in sessions
+            (lambda s=s, packet_id=packet_id: send(
+                dungeon_sweep,
+                s,
+                DungeonSweepReq(dungeon_id=88001),
+                MsgId.DungeonSweepRsp,
+                packet_id=packet_id,
+            ))
+            for packet_id, s in enumerate(sessions, 1)
         ])
     assert all(rsp.status == StatusCode.StatusCode_OK for rsp in responses)
     assert num(Config.VITALITY_ITEM_ID) == 0 and num(102) == 16

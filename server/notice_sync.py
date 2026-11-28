@@ -16,7 +16,7 @@ from proto.net_pb2 import (
 )
 from network.msg_id import MsgId
 from network.remote_link import is_remote_player_id, rsend, sync_subscriptions
-from server import lobby_state, shared_projection
+from server import lobby_state, replicated_roster, scene_data, shared_projection
 from server.scene_data import (
     _action as action,
     _chat_msg as chat_msg,
@@ -38,7 +38,7 @@ from server.scene_data import (
 )
 import utils.db as db
 from utils import item_mgr as items_util, mail_rewards, weather
-from utils import metrics as metrics_registry
+from utils import event_trace, metrics as metrics_registry
 from utils.res_loader import res
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ def init():
             target=_stamina_loop, daemon=False, name="notice-stamina"
         )
         _thread = threading.Thread(target=start_loop, daemon=False, name="notice-sync")
+        scene_data.start_action_workers(_dispatch_action, Config.ACTION_SYNC_WORKERS)
         _stamina_thread.start()
         _thread.start()
         return _thread
@@ -178,12 +179,19 @@ def _append_position_records(response, records):
 
 def _position_response(records):
     response = PlayerSceneSyncDataNotice(status=StatusCode.StatusCode_OK)
+    for field, value in shared_projection.store.roster_metadata().items():
+        setattr(response, field, value)
+    trace = event_trace.current() or event_trace.new_trace()
+    response.trace_id = trace.trace_id
+    response.produced_at_us = trace.produced_at_us
     _append_position_records(response, records)
     return response
 
 
-def _broadcast_position_updates(start_t):
+def _build_position_updates(start_t):
     radius_squared = Config.SCENE_AOI_RADIUS * Config.SCENE_AOI_RADIUS
+    remote_sends = []
+    deliveries = []
     for scene_id, channel_id in rec_list:
         updated_records = list(scene[scene_id][channel_id].items())
         snapshot_records = list(
@@ -219,12 +227,13 @@ def _broadcast_position_updates(start_t):
         if global_due:
             _last_global_position_sync[key] = start_t
 
-        rsend(
-            MsgId.PlayerSceneSyncDataNotice,
-            _position_response(local_snapshot if global_due else local_updated),
-            [scene_id, channel_id],
+        remote_sends.append(
+            (
+                MsgId.PlayerSceneSyncDataNotice,
+                _position_response(local_snapshot if global_due else local_updated),
+                [scene_id, channel_id],
+            )
         )
-
         channel_sessions = [
             session
             for session in session_list
@@ -235,7 +244,7 @@ def _broadcast_position_updates(start_t):
         ]
         projection_by_player = {
             player_id: shared_projection.store.get(player_id)
-            for player_id, _ in local_updated
+            for player_id, _ in updated_records
         }
         global_response = None
         if global_due:
@@ -259,31 +268,49 @@ def _broadcast_position_updates(start_t):
                 )
             else:
                 selected = []
-                for player_id, value in local_updated:
-                    other = projection_by_player.get(player_id)
-                    if (
-                        player_id == session.player_id
-                        or other is None
-                        or projection.squared_distance(other) <= radius_squared
-                    ):
-                        selected.append((player_id, value))
-                remote_selected = remote_updated
+                remote_selected = []
+                for collection, target in (
+                    (local_updated, selected),
+                    (remote_updated, remote_selected),
+                ):
+                    for player_id, value in collection:
+                        other = projection_by_player.get(player_id)
+                        if (
+                            player_id == session.player_id
+                            or other is None
+                            or projection.squared_distance(other) <= radius_squared
+                        ):
+                            target.append((player_id, value))
                 response = _position_response(selected)
                 _append_position_records(response, remote_selected)
                 metrics_registry.metrics.inc("ofps.notice.position_aoi_sends")
                 metrics_registry.metrics.inc(
-                    "ofps.notice.position_aoi_candidates", len(local_updated)
+                    "ofps.notice.position_aoi_candidates", len(updated_records)
                 )
 
             if not selected and not remote_selected:
                 continue
-            session.send(MsgId.PlayerSceneSyncDataNotice, response, 0)
+            deliveries.append(
+                (session, MsgId.PlayerSceneSyncDataNotice, response, 0)
+            )
             metrics_registry.metrics.inc(
                 "ofps.notice.position_players_sent",
                 len(selected) + len(remote_selected),
             )
         scene[scene_id][channel_id].clear()
     rec_list.clear()
+    return remote_sends, deliveries
+
+
+def _send_position_updates(remote_sends, deliveries):
+    for msg_id, response, channel in remote_sends:
+        rsend(msg_id, response, channel)
+    for session, msg_id, response, packet_id in deliveries:
+        session.send(msg_id, response, packet_id)
+
+
+def _broadcast_position_updates(start_t):
+    _send_position_updates(*_build_position_updates(start_t))
 
 
 def stop():
@@ -296,6 +323,7 @@ def stop():
         stamina_thread = _stamina_thread
         thread = _thread
 
+    scene_data.stop_action_workers()
     if stamina_thread is not None and stamina_thread is not threading.current_thread():
         stamina_thread.join()
     if thread is not None and thread is not threading.current_thread():
@@ -356,12 +384,20 @@ def finalize_session(session):
         finalized = _finalize_session_locked(session, time.time())
     if finalized:
         sync_subscriptions()
+        replicator = replicated_roster.active()
+        if replicator is not None:
+            try:
+                replicator.publish()
+            except Exception:
+                logger.exception("Unable to replicate roster after session finalization")
     return finalized
 
 
 def _cleanup_disconnected_locked(timestamp):
+    changed = False
     for session in list(session_list):
-        _finalize_session_locked(session, timestamp)
+        changed = _finalize_session_locked(session, timestamp) or changed
+    return changed
 
 
 def _shutdown_sessions_locked(timestamp):
@@ -369,12 +405,11 @@ def _shutdown_sessions_locked(timestamp):
     response = PlayerOfflineRsp()
     response.status = StatusCode.StatusCode_OK
     response.reason = PlayerOfflineReason.PlayerOfflineReason_SERVER_SHUTDOWN
-    for session in list(session_list):
-        if getattr(session, "running", False) and getattr(session, "logged_in", False):
-            try:
-                session.send(MsgId.PlayerOfflineRsp, response, 0)
-            except Exception:
-                logger.exception("Unable to send offline notice")
+    deliveries = [
+        (session, MsgId.PlayerOfflineRsp, response, 0)
+        for session in session_list
+        if getattr(session, "running", False) and getattr(session, "logged_in", False)
+    ]
     for session in list(session_list):
         _save_local_session(session, timestamp)
         session.logged_in = False
@@ -383,6 +418,7 @@ def _shutdown_sessions_locked(timestamp):
     shared_projection.store.clear()
     clear_scene_snapshots()
     _last_global_position_sync.clear()
+    return deliveries
 
 
 def notice_sync_loop():
@@ -396,103 +432,152 @@ def notice_sync_loop():
         scene_count = 0
         chat_count = 0
         position_count = 0
+        remote_sends = []
+        deliveries = []
+        stamina_due = False
+        shutdown = False
+        membership_changed = False
 
-        # 只在维护会话列表和读取时钟时持有会话锁。广播和数据库操作都使用快照，
-        # 这样动作 worker 可以同时获取其他场景的会话。
         with lock_session:
             if _stop_event.is_set() or sync_stop:
-                _shutdown_sessions_locked(start_t)
-                return
-
-            _cleanup_disconnected_locked(start_t)
-            active_sessions, channel_count = _active_channel_count_locked()
-            elapsed_real = start_t - _rel_time
-            if elapsed_real > 0:
-                previous_weather = weather.weather_at(int(game_time_seconds // 3600))
-                game_time_seconds += elapsed_real * SPEED_MULTIPLIER
-                tod_time = game_time_seconds % 86400.0
-                _rel_time = start_t
-                current_weather = weather.weather_at(int(game_time_seconds // 3600))
-                if previous_weather != current_weather:
-                    notice = SceneWeatherChangeNotice(
-                        status=StatusCode.StatusCode_OK, weather_type=current_weather
-                    )
-                    for session in session_list:
-                        if session.logged_in:
-                            session.send(MsgId.SceneWeatherChangeNotice, notice, 0)
-            with lock_action:
-                # 1970 玩家动作广播
-                action_count = len(action)
-                for scene_id, channel_id, action_notice in action:
-                    if not is_remote_player_id(action_notice.from_player_id):
-                        rsend(MsgId.SendActionNotice, action_notice, [scene_id, channel_id])
-                    for session in session_list:
-                        if session.scene_id == scene_id and session.channel_id == channel_id:
-                            session.send(MsgId.SendActionNotice, action_notice, 0)
-                action.clear()
-            with lock_scene_action:
-                if start_t - _last_send_time >= SEND_INTERVAL_REAL:
-                    time_sync = True
-                    _last_send_time = start_t
-                else:
-                    time_sync = False
-                for session in session_list:
-                    # 1208 场景时间同步
-                    if time_sync:
-                        response = ServerSceneSyncDataNotice()
-                        response.status = StatusCode.StatusCode_OK
-                        tmp = response.data.add().server_data.add()
-                        tmp.action_type = SceneActionType.SceneActionType_TOD_UPDATE
-                        tmp.tod_time = int(tod_time)
-                        session.send(MsgId.ServerSceneSyncDataNotice, response, 0)
-                    # 1208 其他事件
-                    for notice in scene_action[session.scene_id][session.channel_id]:
-                        session.send(MsgId.ServerSceneSyncDataNotice, notice, 0)
-                for scene_id, scene_t in scene_action.items():
-                    for channel_id, channel in scene_t.items():
-                        for notice in channel:
-                            for data in notice.data:
-                                if not is_remote_player_id(data.player_id):
-                                    rsend(
-                                        MsgId.ServerSceneSyncDataNotice,
-                                        notice,
-                                        [scene_id, channel_id],
-                                    )
-                scene_count = sum(
-                    len(channel)
-                    for scene_t in scene_action.values()
-                    for channel in scene_t.values()
-                )
-                scene_action.clear()
-            with lock_chat_msg:
-                for session in session_list:
-                    # 聊天信息同步
-                    for msg in chat_msg:
-                        if msg[3].msg.player_id == session.player_id:
-                            continue
-                        match msg[3].type:
-                            case ChatChannelType.ChatChannel_Default:
-                                if session.scene_id == msg[1] and session.channel_id == msg[2]:
-                                    session.send(MsgId.ChatMsgNotice, msg[3], 0)
-                            case ChatChannelType.ChatChannel_ChatRoom:
-                                if session.chat_channel_id == msg[0]:
-                                    session.send(MsgId.ChatMsgNotice, msg[3], 0)
-                for msg in chat_msg:
-                    if not is_remote_player_id(msg[3].msg.player_id):
-                        rsend(MsgId.ChatMsgNotice, msg[3], [msg[0], msg[1], msg[2]])
-                chat_count = len(chat_msg)
-                chat_msg.clear()
-            with shared_projection.store.locked():
-                with lock_scene:
-                    with lock_rec_list:
-                        position_count = sum(
-                            len(scene[scene_id][channel_id])
-                            for scene_id, channel_id in rec_list
+                deliveries = _shutdown_sessions_locked(start_t)
+                shutdown = True
+            else:
+                membership_changed = _cleanup_disconnected_locked(start_t)
+                active_sessions, channel_count = _active_channel_count_locked()
+                elapsed_real = start_t - _rel_time
+                if elapsed_real > 0:
+                    previous_weather = weather.weather_at(int(game_time_seconds // 3600))
+                    game_time_seconds += elapsed_real * SPEED_MULTIPLIER
+                    tod_time = game_time_seconds % 86400.0
+                    _rel_time = start_t
+                    current_weather = weather.weather_at(int(game_time_seconds // 3600))
+                    if previous_weather != current_weather:
+                        notice = SceneWeatherChangeNotice(
+                            status=StatusCode.StatusCode_OK, weather_type=current_weather
                         )
-                        _broadcast_position_updates(start_t)
-            if start_t - _last_stamina_sync_time > STAMINA_INTERVAL:
-                _stamina_requested.set()
-                _last_stamina_sync_time = start_t
+                        deliveries.extend(
+                            (session, MsgId.SceneWeatherChangeNotice, notice, 0)
+                            for session in session_list
+                            if session.logged_in
+                        )
+                with lock_action:
+                    action_count = len(action)
+                    for scene_id, channel_id, action_notice in action:
+                        if not is_remote_player_id(action_notice.from_player_id):
+                            remote_sends.append(
+                                (
+                                    MsgId.SendActionNotice,
+                                    action_notice,
+                                    [scene_id, channel_id],
+                                )
+                            )
+                        deliveries.extend(
+                            (session, MsgId.SendActionNotice, action_notice, 0)
+                            for session in session_list
+                            if session.scene_id == scene_id
+                            and session.channel_id == channel_id
+                        )
+                    action.clear()
+                with lock_scene_action:
+                    time_sync = start_t - _last_send_time >= SEND_INTERVAL_REAL
+                    if time_sync:
+                        _last_send_time = start_t
+                    for session in session_list:
+                        if time_sync:
+                            response = ServerSceneSyncDataNotice()
+                            response.status = StatusCode.StatusCode_OK
+                            tmp = response.data.add().server_data.add()
+                            tmp.action_type = SceneActionType.SceneActionType_TOD_UPDATE
+                            tmp.tod_time = int(tod_time)
+                            deliveries.append(
+                                (session, MsgId.ServerSceneSyncDataNotice, response, 0)
+                            )
+                        deliveries.extend(
+                            (session, MsgId.ServerSceneSyncDataNotice, notice, 0)
+                            for notice in scene_action[session.scene_id][session.channel_id]
+                        )
+                    for scene_id, scene_t in scene_action.items():
+                        for channel_id, channel in scene_t.items():
+                            for notice in channel:
+                                if any(
+                                    not is_remote_player_id(data.player_id)
+                                    for data in notice.data
+                                ):
+                                    remote_sends.append(
+                                        (
+                                            MsgId.ServerSceneSyncDataNotice,
+                                            notice,
+                                            [scene_id, channel_id],
+                                        )
+                                    )
+                    scene_count = sum(
+                        len(channel)
+                        for scene_t in scene_action.values()
+                        for channel in scene_t.values()
+                    )
+                    scene_action.clear()
+                with lock_chat_msg:
+                    for session in session_list:
+                        for msg in chat_msg:
+                            if msg[3].msg.player_id == session.player_id:
+                                continue
+                            match msg[3].type:
+                                case ChatChannelType.ChatChannel_Default:
+                                    if (
+                                        session.scene_id == msg[1]
+                                        and session.channel_id == msg[2]
+                                    ):
+                                        deliveries.append(
+                                            (session, MsgId.ChatMsgNotice, msg[3], 0)
+                                        )
+                                case ChatChannelType.ChatChannel_ChatRoom:
+                                    if session.chat_channel_id == msg[0]:
+                                        deliveries.append(
+                                            (session, MsgId.ChatMsgNotice, msg[3], 0)
+                                        )
+                    for msg in chat_msg:
+                        if not is_remote_player_id(msg[3].msg.player_id):
+                            remote_sends.append(
+                                (
+                                    MsgId.ChatMsgNotice,
+                                    msg[3],
+                                    [msg[0], msg[1], msg[2]],
+                                )
+                            )
+                    chat_count = len(chat_msg)
+                    chat_msg.clear()
+                with shared_projection.store.locked():
+                    with lock_scene:
+                        with lock_rec_list:
+                            position_count = sum(
+                                len(scene[scene_id][channel_id])
+                                for scene_id, channel_id in rec_list
+                            )
+                            position_remote, position_deliveries = (
+                                _build_position_updates(start_t)
+                            )
+                remote_sends.extend(position_remote)
+                deliveries.extend(position_deliveries)
+                stamina_due = start_t - _last_stamina_sync_time > STAMINA_INTERVAL
+                if stamina_due:
+                    _last_stamina_sync_time = start_t
+
+        for msg_id, response, channel in remote_sends:
+            rsend(msg_id, response, channel)
+        for session, msg_id, response, packet_id in deliveries:
+            session.send(msg_id, response, packet_id)
+        if shutdown:
+            return
+        if membership_changed:
+            replicator = replicated_roster.active()
+            if replicator is not None:
+                try:
+                    replicator.publish()
+                except Exception:
+                    logger.exception("Unable to replicate roster after disconnect cleanup")
+        if stamina_due:
+            _stamina_requested.set()
         use_time = time.time() - start_t
         _record_cycle_metrics(
             use_time,
@@ -513,10 +598,10 @@ def notice_sync_loop():
         if wait_time > 0:
             _stop_event.wait(wait_time)
 
-    # stop() may arrive after the loop's top-of-cycle check.  Always pass
-    # through the final save path before the notice thread is allowed to exit.
     with lock_session:
-        _shutdown_sessions_locked(time.time())
+        deliveries = _shutdown_sessions_locked(time.time())
+    for session, msg_id, response, packet_id in deliveries:
+        session.send(msg_id, response, packet_id)
 
 
 def _stamina_loop():

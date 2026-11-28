@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from config import Config
 from network import remote_link
 from network.msg_id import MsgId
 from proto.net_pb2 import (
@@ -12,7 +14,7 @@ from proto.net_pb2 import (
     ServerSceneSyncDataNotice,
     Vector3,
 )
-from server import scene_data, shared_projection
+from server import link_identity, scene_data, shared_projection
 from server.scene_data import _session_list, lock_session
 from utils.metrics import metrics
 
@@ -67,7 +69,9 @@ class RemotePlayerLifecycleTests(unittest.TestCase):
 
     def test_connection_does_not_prepopulate_legacy_remote_id_base(self):
         link = remote_link._Link(("127.0.0.1", 1))
-        with remote_link._lock:
+        with remote_link._lock, patch.object(
+            remote_link, "_derive_secure_channels"
+        ):
             remote_link._establish_locked(link, 123, "peer", 100.0, True)
         self.assertNotIn("peer", remote_link._server_ids)
         self.assertGreaterEqual(
@@ -75,8 +79,15 @@ class RemotePlayerLifecycleTests(unittest.TestCase):
         )
 
     def test_link_message_pack_roundtrip_uses_bytes(self):
+        private = link_identity.generate_private_key()
+        node_id = link_identity.node_id_for_public_key(
+            link_identity.public_key_bytes(private)
+        )
         message = LinkMessage(id="roundtrip", type=LinkMessage.HEARTBEAT)
-        unpacked = remote_link._unpack(remote_link._pack(message))
+        with patch.object(remote_link, "_identity_private", private), patch.object(
+            Config, "LINK_TRUSTED_NODE_IDS", (node_id,)
+        ):
+            unpacked = remote_link._unpack(remote_link._pack(message))
         self.assertEqual(unpacked.id, "roundtrip")
         self.assertEqual(unpacked.type, LinkMessage.HEARTBEAT)
 

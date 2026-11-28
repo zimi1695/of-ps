@@ -33,6 +33,9 @@ class EconomyStateTests(unittest.TestCase):
     def test_invalid_gacha_pool_does_not_consume(self):
         session = FakeSession()
         with patch.object(gacha, '_configuration', return_value=None), \
+             patch.object(gacha.activities, '_load_operation', return_value=None), \
+             patch.object(db, 'transaction', side_effect=contextlib.nullcontext), \
+             patch.object(item_mgr, 'player_lock', return_value=threading.RLock()), \
              patch.object(gacha.item_mgr, 'consume_items') as consume:
             gacha.Handler().handle(session, GachaReq(gacha_id=999999, is_single=True).SerializeToString(), 1)
         self.assertEqual(session.sent[0][1].status, StatusCode.StatusCode_CFG_NOT_FOUND)
@@ -42,6 +45,8 @@ class EconomyStateTests(unittest.TestCase):
         session = FakeSession()
         info = {'max_times': 50, 'consume_item1_i_d': 104, 'method1_count': 1, 'consume_item1_num': 1}
         with patch.object(gacha, '_configuration', return_value=(info, [101], [102])), \
+             patch.object(gacha.activities, '_load_operation', return_value=None), \
+             patch.object(gacha.activities, '_save_operation'), \
              patch.object(db, 'transaction', side_effect=contextlib.nullcontext), \
              patch.object(item_mgr, 'player_lock', return_value=threading.RLock()), \
              patch.object(item_mgr, 'consume_items', return_value=True), \

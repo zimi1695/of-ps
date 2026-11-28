@@ -6,7 +6,7 @@ from network.remote_link import rsend
 from proto.net_pb2 import PopEmojiReq, PopEmojiRsp, PopEmojiNotice, StatusCode
 from server import shared_projection
 from server.scene_data import get_session
-from utils import achieve_track
+from utils import achieve_track, event_trace
 import utils.db as db
 
 
@@ -34,8 +34,13 @@ class Handler(PacketHandler):
         )
 
         # 向同场景频道玩家广播冒表情
+        event_seq, trace = event_trace.next_event(session)
         notice = PopEmojiNotice()
         notice.status = StatusCode.StatusCode_OK
+        notice.session_generation = getattr(session, "session_generation", 0)
+        notice.event_seq = event_seq
+        notice.trace_id = trace.trace_id
+        notice.produced_at_us = trace.produced_at_us
         notice.emoji_id = req.emoji_id
         notice.from_player_id = session.player_id
         for s in get_session():

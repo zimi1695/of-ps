@@ -1,6 +1,6 @@
 # of-ps 本地加固版
 
-本页对应 `lab/v3.0-hardening`，基于官方 v3.0 合并后的本地实现。
+本页对应本地加固基线；当前 `lab/public-lobby-phase0` 分支包含这些加固，并追加公共大厅与 etcd 协调实现。
 
 ## 模块
 
@@ -29,7 +29,7 @@
 C:\OverFieldLab\runtime\ofps-venv\Scripts\python.exe -m pytest -q tests
 ```
 
-基线结果：`911 passed, 88 subtests passed`（2026-11-27 全量复跑）。采集 / 掉落 / 拾取专项修复后必须复跑。
+基线结果：`1527 passed, 139 subtests passed`（2026-11-28 全量复跑，包含公共大厅分支改动）。采集 / 掉落 / 拾取专项修复后必须复跑。
 
 ## 当前专项
 

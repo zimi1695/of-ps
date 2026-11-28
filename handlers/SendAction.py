@@ -10,7 +10,7 @@ import time
 
 import utils.db as db
 from utils.res_loader import res
-from utils import achieve_track
+from utils import achieve_track, event_trace
 
 
 def _is_learned(player_id, action_id) -> bool:
@@ -52,8 +52,13 @@ class Handler(PacketHandler):
             session.send(MsgId.SendActionRsp, rsp, packet_id)
             return
 
+        event_seq, trace = event_trace.next_event(session)
         tmp = SendActionNotice()
         tmp.status = StatusCode.StatusCode_OK
+        tmp.session_generation = getattr(session, "session_generation", 0)
+        tmp.event_seq = event_seq
+        tmp.trace_id = trace.trace_id
+        tmp.produced_at_us = trace.produced_at_us
         tmp.action_id = req.action_id
         tmp.from_player_id = session.player_id
         tmp.from_player_name = session.player_name

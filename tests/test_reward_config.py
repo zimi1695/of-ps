@@ -28,24 +28,30 @@ class FakeSession:
 
 
 class RewardConfigTests(unittest.TestCase):
-    def test_recall_missing_config_rolls_back_claim(self):
+    def test_recall_missing_config_has_no_side_effects(self):
         session = FakeSession()
         request = ActivityRecallRewardClaimReq(activity_id=1, condition_id=2)
         with patch.object(Config, 'ACTIVITY_RECALL_REWARDS', {}), \
-             patch.object(recall.db, 'try_claim', return_value=True), \
-             patch.object(recall.db, 'rollback_claim') as rollback, \
-             patch.object(recall.db, 'grant_rewards') as grant:
+             patch.object(recall.redemption.db, 'try_claim') as claim, \
+             patch.object(recall.redemption.db, 'grant_rewards') as grant, \
+             patch.object(recall.redemption.db, 'transaction', side_effect=contextlib.nullcontext), \
+             patch.object(recall.redemption.item_mgr, 'player_lock', return_value=threading.RLock()), \
+             patch.object(recall.redemption, '_load_operation', return_value=None):
             recall.Handler().handle(session, request.SerializeToString(), 1)
         self.assertEqual(session.sent[0][1].status, StatusCode.StatusCode_CFG_NOT_FOUND)
-        rollback.assert_called_once()
+        claim.assert_not_called()
         grant.assert_not_called()
 
     def test_recall_uses_explicit_reward_config(self):
         session = FakeSession()
         request = ActivityRecallRewardClaimReq(activity_id=1, condition_id=2)
         with patch.object(Config, 'ACTIVITY_RECALL_REWARDS', {(1, 2): ((101, 5),)}), \
-             patch.object(recall.db, 'try_claim', return_value=True), \
-             patch.object(recall.db, 'grant_rewards') as grant, \
+             patch.object(recall.redemption.db, 'try_claim', return_value=True), \
+             patch.object(recall.redemption.db, 'grant_rewards') as grant, \
+             patch.object(recall.redemption.db, 'transaction', side_effect=contextlib.nullcontext), \
+             patch.object(recall.redemption.item_mgr, 'player_lock', return_value=threading.RLock()), \
+             patch.object(recall.redemption, '_load_operation', return_value=None), \
+             patch.object(recall.redemption, '_save_operation'), \
              patch.object(recall.achieve_track, 'report'):
             recall.Handler().handle(session, request.SerializeToString(), 1)
         self.assertEqual(session.sent[0][1].status, StatusCode.StatusCode_OK)

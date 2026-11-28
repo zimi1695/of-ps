@@ -91,6 +91,22 @@ class SharedProjectionTests(unittest.TestCase):
             metrics.snapshot()["gauges"]["ofps.projection.active"], 0
         )
 
+    def test_roster_sequence_changes_only_for_membership_or_authority(self):
+        self.store.update_from_recorder(10, 1, 2, recorder())
+        first = self.store.roster_metadata()
+        self.store.update_from_recorder(10, 1, 2, recorder(position=(4, 5, 6)))
+        self.assertEqual(self.store.roster_metadata(), first)
+        self.store.move(10, 1, 3)
+        moved = self.store.roster_metadata()
+        self.assertEqual(moved["roster_seq"], first["roster_seq"] + 1)
+        self.store.set_authority(2, 9)
+        authority = self.store.roster_metadata()
+        self.assertEqual(authority["config_generation"], 2)
+        self.assertEqual(authority["authority_epoch"], 9)
+        self.assertEqual(authority["roster_seq"], moved["roster_seq"] + 1)
+        with self.assertRaises(ValueError):
+            self.store.set_authority(1, 8)
+
     def test_concurrent_updates_are_serialized(self):
         def worker(player_id):
             for index in range(100):

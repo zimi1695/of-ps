@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from config import Config
 from network.msg_id import MsgId
 from proto.net_pb2 import (
@@ -36,6 +37,7 @@ import handlers.TreasureBoxOpen as box_open
 import handlers.TreasureBoxPickup as box_pickup
 import server.minigames as minigames
 import server.scene_data as scene_data
+from server import entity_authority
 import utils.db as db
 import utils.res_loader as res_loader
 from utils import item_mgr, pb_create
@@ -62,6 +64,15 @@ class FakeSession:
 
     def response(self, message_id):
         return [message for mid, message, _ in self.sent if mid == message_id][-1]
+
+
+@pytest.fixture(autouse=True)
+def entity_owner(monkeypatch):
+    authority = entity_authority.activate(
+        Config.LOBBY_HOST_ID, Ed25519PrivateKey.generate()
+    )
+    yield authority
+    entity_authority.deactivate(authority)
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +135,18 @@ def _gather_request(session, *, lucky=False):
 def _gather(session, request):
     gather.Handler().handle(session, request.SerializeToString(), 1)
     return session.response(MsgId.GatherRsp)
+
+
+def test_gather_rejects_entity_owned_by_another_host(entity_owner):
+    session = FakeSession()
+    request = _gather_request(session)
+    domain = entity_authority.entity_domain("gather", session.scene_id, session.channel_id)
+    entity_owner.assert_owner(domain, request.gather_item.index)
+    entity_owner.transfer(domain, request.gather_item.index, "other-host")
+    before = item_mgr.get_num(session.player_id, 101)
+    response = _gather(session, request)
+    assert response.status == StatusCode.StatusCode_FAIL
+    assert item_mgr.get_num(session.player_id, 101) == before
 
 
 def _material_item(count=2):

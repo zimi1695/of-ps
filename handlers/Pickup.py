@@ -1,4 +1,5 @@
 from google.protobuf.message import DecodeError
+import logging
 
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
@@ -13,7 +14,17 @@ from proto.net_pb2 import (
 )
 
 import utils.db as db
+from server import entity_authority
 from utils import achieve_track, item_mgr
+
+logger = logging.getLogger(__name__)
+
+
+def _release_ownership(authority, domain, entity_id):
+    try:
+        authority.release(domain, entity_id)
+    except Exception:
+        logger.warning("Unable to release drop ownership", exc_info=True)
 
 
 @packet_handler(MsgId.PickupReq)
@@ -41,12 +52,31 @@ class Handler(PacketHandler):
             rsp.status = StatusCode.StatusCode_FAIL
             session.send(MsgId.PickupRsp, rsp, packet_id)
             return
+        authority = entity_authority.active()
+        ownership_domain = entity_authority.entity_domain(
+            "drop", session.scene_id, session.channel_id, session.player_id
+        )
+        if authority is None:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.PickupRsp, rsp, packet_id)
+            return
+        try:
+            authority.assert_owner(
+                ownership_domain,
+                req.drop_item_index,
+                require_shared=Config.LINK_OTHER_SERVER,
+            )
+        except entity_authority.OwnershipError:
+            rsp.status = StatusCode.StatusCode_FAIL
+            session.send(MsgId.PickupRsp, rsp, packet_id)
+            return
         if req.pick_index == -1:
             slots = list(range(len(remaining)))
         elif 1 <= req.pick_index <= len(remaining):
             slots = [req.pick_index - 1]
         else:
             rsp.status = StatusCode.StatusCode_BAD_REQ
+            _release_ownership(authority, ownership_domain, req.drop_item_index)
             session.send(MsgId.PickupRsp, rsp, packet_id)
             return
 
@@ -61,16 +91,17 @@ class Handler(PacketHandler):
             instances = sum(item_mgr.needs_temp_pack(item) for _, item in picks)
             if len(session.temp_pack) + instances > Config.TEMP_PACK_MAX:
                 rsp.status = StatusCode.StatusCode_Temp_Pack_Is_Full
+                _release_ownership(authority, ownership_domain, req.drop_item_index)
                 session.send(MsgId.PickupRsp, rsp, packet_id)
                 return
         except (DecodeError, item_mgr.EconomyConfigError, TypeError, ValueError):
             rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+            _release_ownership(authority, ownership_domain, req.drop_item_index)
             session.send(MsgId.PickupRsp, rsp, packet_id)
             return
 
         pack = PackNotice(status=StatusCode.StatusCode_OK)
         staged_temp_pack = []
-        consumed_slots = []
         with item_mgr.deferred_notifications(), db.transaction():
             fresh = []
             for slot, item in picks:
@@ -89,23 +120,26 @@ class Handler(PacketHandler):
                     pack,
                     staged_temp_pack=staged_temp_pack,
                 )
-                consumed_slots = [slot for slot, _ in fresh]
                 rsp.status = StatusCode.StatusCode_OK
 
-        if rsp.status != StatusCode.StatusCode_OK:
+        if rsp.status not in (
+            StatusCode.StatusCode_OK,
+            StatusCode.StatusCode_REPEAT_GET_REWARD,
+        ):
             session.send(MsgId.PickupRsp, rsp, packet_id)
             return
 
-        # 会话标记只在 DB 提交后变化; 任一步保存失败都会保留掉落供重试。
-        consumed = set(consumed_slots)
+        # 已领取槽位也从会话移除，避免崩溃恢复后反复返回重复领取。
+        consumed = {slot for slot, _ in picks}
         remaining[:] = [
             blob for slot, blob in enumerate(remaining) if slot not in consumed
         ]
         if not remaining:
             session.drop_items.pop(req.drop_item_index, None)
+            _release_ownership(authority, ownership_domain, req.drop_item_index)
         session.temp_pack.extend(staged_temp_pack)
         for _, item in fresh:
             achieve_track.report(session, "pickup", match=item.main_item.item_id)
         session.send(MsgId.PickupRsp, rsp, packet_id)
-        if pack.items:
+        if rsp.status == StatusCode.StatusCode_OK and pack.items:
             session.send(MsgId.PackNotice, pack, 0)

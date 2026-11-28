@@ -1,3 +1,4 @@
+import hashlib
 import socket
 import threading
 import logging
@@ -6,11 +7,18 @@ import uuid
 import os
 import json
 import random
+import secrets
 import struct
-from datetime import datetime
 from config import Config
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from network.msg_id import MsgId
 from network.game_session import GameSession, snappy
+from network.secure_channel import SecureChannel
 from proto.net_pb2 import (
     LinkNegotiate,
     LinkPacket,
@@ -24,7 +32,9 @@ from proto.net_pb2 import (
     PopEmojiNotice,
     ScenePlayer,
 )
-from server import lobby_state, shared_projection
+from server import lobby_state, link_identity, replicated_roster, shared_projection
+from server.channel_identity import canonical_json
+from utils import event_trace
 from server.scene_data import (
     get_session,
     up_action,
@@ -85,6 +95,11 @@ class _Link:
         "peer_names",
         "subs",
         "subs_valid",
+        "local_ephemeral",
+        "remote_ephemeral",
+        "remote_node_id",
+        "secure_send",
+        "secure_receive",
     )
 
     def __init__(self, addr):
@@ -103,6 +118,11 @@ class _Link:
         self.peer_names = set()  # 对端心跳上报的直连服务器名(用于二跳路由)
         self.subs = set()  # 对端订阅的场景 (scene_id<<32|channel_id)
         self.subs_valid = False  # 未收到订阅上报时按"全订阅"处理
+        self.local_ephemeral = None
+        self.remote_ephemeral = None
+        self.remote_node_id = ""
+        self.secure_send = None
+        self.secure_receive = None
 
 
 # _lock 保护以下所有状态。
@@ -111,6 +131,9 @@ _links = {}  # addr -> _Link
 _conv_to_addr = {}  # conv -> addr (含握手中预留的conv)
 _server_ids = {}  # server_name -> 玩家id偏移
 _seen_msgs = {}  # msg.id -> time (广播去重)
+_seen_nonces = {}  # negotiation nonce -> monotonic expiry
+_identity_private = None
+_node_id = ""
 _lock = threading.Lock()
 _cache_dirty = False
 _socket = None
@@ -119,9 +142,7 @@ _stopped = threading.Event()
 _lifecycle_lock = threading.Lock()
 _listen_thread = None
 _maintenance_thread = None
-_name = (
-    f"{Config.SERVER_NAME}&{uuid.uuid4().hex[:8]}&{datetime.now():%Y-%m-%d %H:%M:%S}"
-)
+_name = Config.SERVER_NAME
 
 try:
     KCP_IMPORT_FAILED = False
@@ -155,12 +176,30 @@ def _send_raw(data, addr):
 
 
 def _send_neg(addr, ntype, conv):
+    if _identity_private is None:
+        raise RuntimeError("authenticated link identity is not initialized")
+    addr = tuple(addr)
+    with _lock:
+        link = _links.get(addr)
+        if link is None:
+            link = _Link(addr)
+            _links[addr] = link
+        if link.local_ephemeral is None:
+            link.local_ephemeral = X25519PrivateKey.generate()
+        ephemeral_public = link.local_ephemeral.public_key().public_bytes_raw()
     neg = LinkNegotiate(
         type=ntype,
         conv=conv,
         server_name=_name,
         is_public=bool(Config.SELF_ADDR_IS_PUBLIC),
+        node_id=_node_id,
+        public_key=link_identity.public_key_bytes(_identity_private),
+        channel_id=Config.LINK_CHANNEL_ID,
+        nonce=secrets.randbits(63) or 1,
+        issued_at_us=time.time_ns() // 1000,
+        ephemeral_public=ephemeral_public,
     )
+    link_identity.sign_negotiation(neg, _identity_private)
     logger.debug("Sending link negotiation type=%s conv=%s to %s", ntype, conv, addr)
     _send_raw(struct.pack("!B", PACKET_NEGOTIATE) + neg.SerializeToString(), addr)
 
@@ -180,20 +219,73 @@ def _release_conv_locked(link):
     return old or None
 
 
-def _begin_connect_locked(link, now):
+def _begin_connect_locked(link, now, preferred_conv=None):
     """进入握手状态并预留conv, 返回应发送PROPOSE的conv"""
     _release_conv_locked(link)
+    link.local_ephemeral = None
+    link.remote_ephemeral = None
+    link.remote_node_id = ""
+    link.secure_send = None
+    link.secure_receive = None
     link.state = CONNECTING
-    link.conv = _alloc_conv_locked()
+    if preferred_conv is not None and not (
+        1 <= int(preferred_conv) <= 0x7FFFFFFF
+        and int(preferred_conv) not in _conv_to_addr
+    ):
+        preferred_conv = None
+    link.conv = (
+        int(preferred_conv)
+        if preferred_conv is not None
+        else _alloc_conv_locked()
+    )
     _conv_to_addr[link.conv] = link.addr
     link.tries = 1
     link.next_try = now + NEGOTIATE_INTERVAL
     return link.conv
 
 
+def _derive_secure_channels(link, conv):
+    if (
+        link.local_ephemeral is None
+        or not link.remote_ephemeral
+        or not link.remote_node_id
+        or not _node_id
+    ):
+        raise link_identity.LinkIdentityError("missing authenticated key exchange")
+    shared = link.local_ephemeral.exchange(
+        X25519PublicKey.from_public_bytes(link.remote_ephemeral)
+    )
+    transcript = canonical_json(
+        {
+            "channel_id": Config.LINK_CHANNEL_ID,
+            "conv": int(conv),
+            "node_ids": sorted([_node_id, link.remote_node_id]),
+            "ephemeral_public_keys": sorted(
+                [
+                    link.local_ephemeral.public_key().public_bytes_raw().hex(),
+                    link.remote_ephemeral.hex(),
+                ]
+            ),
+        }
+    )
+    material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=None,
+        info=b"ofps-link-channel-v1\0" + transcript,
+    ).derive(shared)
+    if _node_id < link.remote_node_id:
+        link.secure_send = SecureChannel(material[:32], material[32:])
+        link.secure_receive = SecureChannel(material[:32], material[32:])
+    else:
+        link.secure_send = SecureChannel(material[32:], material[:32])
+        link.secure_receive = SecureChannel(material[32:], material[:32])
+
+
 def _establish_locked(link, conv, server_name, now, is_public):
     """置为已连接, 返回交给 _after_connected 在锁外执行的上下文"""
     global _cache_dirty
+    _derive_secure_channels(link, conv)
     prev_name = link.server_name if link.state == CONNECTED else ""
     old_conv = _release_conv_locked(link)
     link.state = CONNECTED
@@ -220,13 +312,17 @@ def _after_connected(ctx):
     addr, conv, server_name, queued, old_conv, prev_name = ctx
     with _lifecycle_lock:
         kcp = _kcp
-        if _stopped.is_set() or kcp is None:
+        if _stopped.is_set():
+            logger.debug("Connection established after link shutdown: %s", addr)
+            return
+        if kcp is None:
+            logger.error("Connection established without KCP manager: %s", addr)
             return
         if old_conv and old_conv != conv:
             kcp.remove(old_conv)
         session = kcp.get_or_create(conv)
         for data in queued:
-            session.send(data)
+            session.send(_encrypt_packed(data, conv))
     if prev_name and not _stopped.is_set():
         # 已连接状态下对方提议了新conv => 对端重启过, 旧远程会话作废等待重新同步
         _drop_remote_sessions(prev_name)
@@ -291,6 +387,11 @@ def _disconnect(addr, reason):
         old_conv = _release_conv_locked(link)
         name = link.server_name
         link.state = DISCONNECTED
+        link.local_ephemeral = None
+        link.remote_ephemeral = None
+        link.remote_node_id = ""
+        link.secure_send = None
+        link.secure_receive = None
         link.queued.clear()
         link.queued_bytes = 0
         link.tries = 0
@@ -332,7 +433,32 @@ def _on_negotiate(payload, addr):
         return
     if not 1 <= neg.conv <= 0x7FFFFFFF or len(neg.server_name.encode("utf-8")) > MAX_SERVER_NAME_BYTES:
         return
+    try:
+        peer_node_id = link_identity.verify_negotiation(
+            neg,
+            Config.LINK_TRUSTED_NODE_IDS,
+            Config.LINK_CHANNEL_ID,
+            max_skew_us=int(Config.LINK_NEGOTIATION_MAX_SKEW_SEC * 1_000_000),
+        )
+    except link_identity.LinkIdentityError as error:
+        logger.warning("Rejecting unauthenticated link negotiation from %s: %s", addr, error)
+        from utils import metrics as metrics_registry
+
+        metrics_registry.metrics.inc("ofps.link.auth_rejections_total")
+        return
     now = time.monotonic()
+    with _lock:
+        if neg.nonce in _seen_nonces:
+            logger.warning("Rejecting replayed link negotiation from %s", addr)
+            return
+        expiry = now + Config.LINK_NEGOTIATION_MAX_SKEW_SEC * 2
+        if len(_seen_nonces) >= MAX_SEEN_MSGS:
+            _seen_nonces.pop(next(iter(_seen_nonces)), None)
+        _seen_nonces[neg.nonce] = expiry
+        link = _links.get(addr)
+        if link is not None and link.state != CONNECTED:
+            link.remote_ephemeral = neg.ephemeral_public
+            link.remote_node_id = peer_node_id
 
     if neg.type == LinkNegotiate.PROPOSE:
         reply = None
@@ -347,9 +473,27 @@ def _on_negotiate(payload, addr):
                 if link is None:
                     link = _Link(addr)
                     _links[addr] = link
+                link.remote_ephemeral = neg.ephemeral_public
+                link.remote_node_id = peer_node_id
                 if link.state == CONNECTED and link.conv == neg.conv:
-                    # 对方没收到ACCEPT重发了PROPOSE, 幂等应答
+                    # 对方没收到ACCEPT重发了PROPOSE, 幂等应答；密钥变化则重新派生。
+                    if link.remote_ephemeral != neg.ephemeral_public:
+                        link.remote_ephemeral = neg.ephemeral_public
+                        link.remote_node_id = peer_node_id
+                        _derive_secure_channels(link, neg.conv)
                     reply = (LinkNegotiate.ACCEPT, neg.conv)
+                elif link.state == CONNECTED:
+                    # 已连接时只接受更大的conv；旧提案要求对端用当前conv重新握手。
+                    if neg.conv > link.conv:
+                        link.local_ephemeral = X25519PrivateKey.generate()
+                        link.remote_ephemeral = neg.ephemeral_public
+                        link.remote_node_id = peer_node_id
+                        established = _establish_locked(
+                            link, neg.conv, neg.server_name, now, neg.is_public
+                        )
+                        reply = (LinkNegotiate.ACCEPT, link.conv)
+                    else:
+                        reply = (LinkNegotiate.CONFLICT, link.conv)
                 elif link.state == CONNECTING and neg.conv < link.conv:
                     # 双方同时PROPOSE: 统一采用较大的conv, 对方会接受我们的提议
                     pass
@@ -357,6 +501,8 @@ def _on_negotiate(payload, addr):
                     reply = (LinkNegotiate.CONFLICT, neg.conv)
                 else:
                     # 未连接 / 同时PROPOSE中对方conv更大 / 对端重启换了conv
+                    if link.local_ephemeral is None or link.state == CONNECTED:
+                        link.local_ephemeral = X25519PrivateKey.generate()
                     established = _establish_locked(
                         link, neg.conv, neg.server_name, now, neg.is_public
                     )
@@ -372,10 +518,23 @@ def _on_negotiate(payload, addr):
             link = _links.get(addr)
             if link is not None and link.state == CONNECTING:
                 other = _conv_to_addr.get(neg.conv)
+                logger.debug(
+                    "Accepting link conv=%s mapped=%s addr=%s",
+                    neg.conv,
+                    other,
+                    addr,
+                )
                 if other is None or other == addr:
                     established = _establish_locked(
                         link, neg.conv, neg.server_name, now, neg.is_public
                     )
+            elif link is not None:
+                logger.debug(
+                    "Ignoring link ACCEPT in state=%s conv=%s accepted=%s",
+                    link.state,
+                    link.conv,
+                    neg.conv,
+                )
         if established is not None:
             _after_connected(established)
 
@@ -384,7 +543,15 @@ def _on_negotiate(payload, addr):
         with _lock:
             link = _links.get(addr)
             if link is not None and link.state == CONNECTING:
-                conv = _begin_connect_locked(link, now)
+                conv = _begin_connect_locked(
+                    link,
+                    now,
+                    preferred_conv=(
+                        neg.conv
+                        if link.conv and neg.conv > link.conv
+                        else None
+                    ),
+                )
         if conv is not None:
             _send_neg(addr, LinkNegotiate.PROPOSE, conv)
 
@@ -401,6 +568,9 @@ def _output(conv):
 
 
 def _pack(msg):
+    if _identity_private is None:
+        raise RuntimeError("link messages require an initialized identity")
+    link_identity.sign_link_message(msg, _identity_private)
     data = msg.SerializeToString()
     if len(data) > MAX_LINK_MESSAGE_BYTES:
         raise ValueError("link message exceeds size limit")
@@ -427,6 +597,7 @@ def _unpack(data):
         raise ValueError("invalid link message length")
     msg = LinkMessage()
     msg.ParseFromString(raw)
+    link_identity.verify_link_message(msg, Config.LINK_TRUSTED_NODE_IDS)
     return msg
 
 
@@ -442,6 +613,35 @@ def _make_msg(mtype):
         msg = LinkMessage(id=uuid.uuid4().hex, origin=_name, type=mtype)
         _remember_seen_locked(msg.id)
     return msg
+
+
+def _encrypt_packed(data, conv):
+    with _lock:
+        link = next(
+            (item for item in _links.values() if item.conv == conv and item.state == CONNECTED),
+            None,
+        )
+        cipher = link.secure_send if link is not None else None
+    if cipher is None:
+        raise link_identity.LinkIdentityError("cannot send on an unauthenticated link")
+    return cipher.encrypt(data)
+
+
+def _decrypt_packed(data, addr):
+    with _lock:
+        link = _links.get(tuple(addr))
+        cipher = (
+            link.secure_receive
+            if link is not None and link.state == CONNECTED
+            else None
+        )
+    if cipher is None:
+        raise link_identity.LinkIdentityError("cannot receive on an unauthenticated link")
+    return cipher.decrypt(data)
+
+
+def _send_packed(conv, data):
+    return _kcp_send(conv, _encrypt_packed(data, conv))
 
 
 def _send_to(msg, addr):
@@ -467,7 +667,7 @@ def _send_to(msg, addr):
             logger.debug("Link queue full for %s", addr)
             return
     if conv is not None:
-        _kcp_send(conv, data)
+        _send_packed(conv, data)
     else:
         # 未连接: 消息已排队, 确保握手在进行
         _connect(addr)
@@ -483,7 +683,7 @@ def _broadcast(msg, exclude=None):
             if l.state == CONNECTED and l.server_name != exclude
         ]
     for conv in convs:
-        _kcp_send(conv, data)
+        _send_packed(conv, data)
 
 
 def _sub_key(scene_id, channel_id):
@@ -539,12 +739,12 @@ def _broadcast_data(msg, interest=None):
         if rt:
             del msg.relay_to[:]
             msg.relay_to.extend(rt)
-            _kcp_send(conv, _pack(msg))
+            _send_packed(conv, _pack(msg))
         else:
             if plain is None:
                 del msg.relay_to[:]
                 plain = _pack(msg)
-            _kcp_send(conv, plain)
+            _send_packed(conv, plain)
     del msg.relay_to[:]
 
 
@@ -563,7 +763,7 @@ def _relay_data(msg):
     if convs:
         data = _pack(msg)
         for conv in convs:
-            _kcp_send(conv, data)
+            _send_packed(conv, data)
 
 
 def _handle_data(origin, datas, mid, payload):
@@ -604,6 +804,19 @@ def _handle_data(origin, datas, mid, payload):
                 if sd.player.player_id:
                     sd.player.player_id = _trans_id(origin, sd.player.player_id)
         up_scene_action(datas[0], datas[1], rsp)
+        replicator = replicated_roster.active()
+        if replicator is not None and any(
+            data.server_data
+            and any(
+                item.action_type in {
+                    SceneActionType.SceneActionType_ENTER,
+                    SceneActionType.SceneActionType_LEAVE,
+                }
+                for item in data.server_data
+            )
+            for data in rsp.data
+        ):
+            replicator.publish()
     elif mid == 1936:
         rsp = ChatMsgNotice()
         rsp.ParseFromString(payload)
@@ -694,6 +907,9 @@ def _on_new_server(name, addr):
     _share_servers(addr)
     _sync_players(addr)
     sync_subscriptions()
+    replicator = replicated_roster.active()
+    if replicator is not None:
+        replicator.resume()
 
 
 def _add_remote_player(origin, info):
@@ -776,7 +992,7 @@ def _on_recv(conv, data):
     if addr is None:
         return
     try:
-        _process(data, addr)
+        _process(_decrypt_packed(data, addr), addr)
     except Exception:
         # KCPManager会静默吞掉回调异常, 在这里记录
         logger.exception(f"Error processing link message from {addr}")
@@ -832,7 +1048,10 @@ def _listen():
                 _on_kcp_packet(payload, addr)
         except Exception as e:
             # 单个报文的解析/处理错误(畸形数据、端口扫描等)不能杀死监听线程
-            logger.debug(f"bad packet from {addr}: {e}")
+            if ptype == PACKET_NEGOTIATE:
+                logger.warning("Rejecting invalid negotiation from %s: %s", addr, e)
+            else:
+                logger.debug(f"bad packet from {addr}: {e}")
 
 
 def _make_state_heartbeat():
@@ -970,11 +1189,13 @@ def _reset_link_state_locked():
     _conv_to_addr.clear()
     _server_ids.clear()
     _seen_msgs.clear()
+    _seen_nonces.clear()
     _cache_dirty = False
 
 
 def init():
     global _socket, _kcp, _listen_thread, _maintenance_thread, _name
+    global _identity_private, _node_id
     if not Config.LINK_OTHER_SERVER:
         return
 
@@ -986,15 +1207,18 @@ def init():
         ):
             raise RuntimeError("remote link threads are still stopping")
         if KCP_IMPORT_FAILED:
-            logger.warning("KCP import failed. Link module disabled.")
-            return
+            raise RuntimeError("authenticated link transport requires the KCP extension")
 
+        _identity_private = link_identity.load_or_create_identity(
+            Config.LINK_IDENTITY_PATH
+        )
+        _node_id = link_identity.node_id_for_public_key(
+            link_identity.public_key_bytes(_identity_private)
+        )
         _stopped.clear()
         with _lock:
             _reset_link_state_locked()
-        _name = (
-            f"{Config.SERVER_NAME}&{uuid.uuid4().hex[:8]}&{datetime.now():%Y-%m-%d %H:%M:%S}"
-        )
+        _name = f"{Config.SERVER_NAME}&{_node_id}"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(0.5)
@@ -1030,6 +1254,10 @@ def init():
     servers.discard(tuple(Config.SELF_ADDR))
     for addr in servers:
         _connect(addr, force=True)
+    if not servers:
+        replicator = replicated_roster.active()
+        if replicator is not None:
+            replicator.resume()
 
 
 def stop():
@@ -1083,6 +1311,17 @@ def rsend(msg_id, proto_msg, datas=None):
         msg.datas.extend(datas)
     msg.msg_id = msg_id
     msg.payload = proto_msg.SerializeToString()
+    trace = event_trace.current()
+    if trace is None and getattr(proto_msg, "trace_id", 0):
+        trace = event_trace.new_trace(
+            proto_msg.trace_id, proto_msg.produced_at_us
+        )
+    trace = trace or event_trace.new_trace()
+    msg.trace_id = trace.trace_id
+    msg.event_seq = getattr(proto_msg, "event_seq", 0)
+    msg.session_generation = getattr(proto_msg, "session_generation", 0)
+    for field, value in shared_projection.store.roster_metadata().items():
+        setattr(msg, field, value)
     # 高频的动作(1970)/位置同步(1206)只发给对该场景感兴趣的服务器;
     # 1208(含进场事件,维护全局玩家目录)和1936(聊天,漏一条就是永久丢失)不过滤
     interest = None

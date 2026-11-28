@@ -168,10 +168,17 @@ class LobbyAoiTests(unittest.TestCase):
                 {item.player_id for item in session.sent[0][1].data}, {1, 2}
             )
 
-    def test_remote_players_remain_visible(self):
+    def test_remote_increment_uses_same_aoi_filter(self):
         sessions = self.populate({1: (0, 0, 0), 2: (5, 0, 0)})
-        _scene[1][1][2000000] = recorder(50, 0, 0)
-        _scene_snapshot[1][1][2000000] = recorder(50, 0, 0)
+        for player_id, x in ((2000000, 50), (2000001, 5)):
+            shared_projection.store.update(
+                shared_projection.SharedProjection(
+                    player_id=player_id,
+                    scene_id=1,
+                    channel_id=1,
+                    position=(float(x), 0.0, 0.0),
+                )
+            )
         with patch.object(notice_sync, "rsend"), patch.object(
             Config, "SCENE_AOI_RADIUS", 10.0
         ), patch.object(Config, "SCENE_GLOBAL_SYNC_INTERVAL", 0.5):
@@ -179,14 +186,40 @@ class LobbyAoiTests(unittest.TestCase):
             for session in sessions:
                 session.sent.clear()
             self.queue_positions({1: (0, 0, 0), 2: (5, 0, 0)})
-            _scene[1][1][2000000] = recorder(50, 0, 0)
-            _scene_snapshot[1][1][2000000] = recorder(50, 0, 0)
+            for player_id, x in ((2000000, 50), (2000001, 5)):
+                _scene[1][1][player_id] = recorder(x, 0, 0)
+                _scene_snapshot[1][1][player_id] = recorder(x, 0, 0)
             notice_sync._broadcast_position_updates(100.1)
         for session in sessions:
-            self.assertIn(
-                2000000,
-                {item.player_id for item in session.sent[0][1].data},
-            )
+            visible = {item.player_id for item in session.sent[0][1].data}
+            self.assertIn(2000001, visible)
+            self.assertNotIn(2000000, visible)
+
+    def test_broadcast_send_happens_outside_session_lock(self):
+        import threading
+
+        session = self.populate({1: (0, 0, 0)})[0]
+        session.remote = True
+        original_send = session.send
+
+        def send_and_stop(*args):
+            acquired = notice_sync.lock_session.acquire(blocking=False)
+            self.assertTrue(acquired)
+            notice_sync.lock_session.release()
+            original_send(*args)
+            notice_sync._stop_event.set()
+
+        session.send = send_and_stop
+        notice_sync._stop_event.clear()
+        notice_sync._rel_time = notice_sync.time.time()
+        notice_sync._last_send_time = notice_sync._rel_time
+        with patch.object(notice_sync, "rsend"):
+            thread = threading.Thread(target=notice_sync.notice_sync_loop)
+            thread.start()
+            thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(session.sent)
+        notice_sync._stop_event.clear()
 
 
 if __name__ == "__main__":

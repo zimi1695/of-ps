@@ -6,7 +6,8 @@ import math
 import os
 import time
 import uuid
-from threading import Lock
+from contextlib import contextmanager
+from threading import Lock, RLock
 
 from google.protobuf.message import DecodeError
 from proto.net_pb2 import PlayerRecorderData
@@ -24,13 +25,17 @@ class StaleEpochError(LobbyStateError):
     pass
 
 
-def capture_lobby_state(host_id, epoch):
+def capture_lobby_state(host_id, epoch, channel_id=None):
+    if channel_id is not None and (
+        not isinstance(channel_id, str) or not channel_id
+    ):
+        raise LobbyStateError("lobby state channel_id is invalid")
     scene_snapshots = {}
     with shared_projection.store.locked():
         for scene_id, channels in export_scene_snapshots().items():
             scene_snapshots[str(scene_id)] = {}
-            for channel_id, players in channels.items():
-                scene_snapshots[str(scene_id)][str(channel_id)] = {
+            for scene_channel_id, players in channels.items():
+                scene_snapshots[str(scene_id)][str(scene_channel_id)] = {
                     str(player_id): base64.b64encode(payload).decode("ascii")
                     for player_id, payload in players.items()
                 }
@@ -38,14 +43,18 @@ def capture_lobby_state(host_id, epoch):
             str(player_id): projection
             for player_id, projection in shared_projection.store.snapshot().items()
         }
-    return {
+    state = {
         "version": STATE_VERSION,
         "host_id": str(host_id),
         "epoch": int(epoch),
         "captured_at": time.time(),
+        **shared_projection.store.roster_metadata(),
         "projections": projections,
         "scene_snapshots": scene_snapshots,
     }
+    if channel_id is not None:
+        state["channel_id"] = channel_id
+    return state
 
 
 def validate_lobby_state(state):
@@ -55,6 +64,10 @@ def validate_lobby_state(state):
         raise LobbyStateError("unsupported lobby state version")
     if not isinstance(state.get("host_id"), str) or not state["host_id"]:
         raise LobbyStateError("lobby state host_id is invalid")
+    if "channel_id" in state and (
+        not isinstance(state["channel_id"], str) or not state["channel_id"]
+    ):
+        raise LobbyStateError("lobby state channel_id is invalid")
     epoch = state.get("epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
         raise LobbyStateError("lobby state epoch is invalid")
@@ -62,11 +75,31 @@ def validate_lobby_state(state):
         raise LobbyStateError("lobby state projections are invalid")
     if not isinstance(state.get("scene_snapshots"), dict):
         raise LobbyStateError("lobby state scene snapshots are invalid")
+    for field, default, minimum in (
+        ("config_generation", 1, 1),
+        ("authority_epoch", int(state["epoch"]), 1),
+        ("roster_seq", 0, 0),
+    ):
+        value = state.get(field, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum
+        ):
+            raise LobbyStateError(f"lobby state {field} is invalid")
     return state
 
 
-def restore_lobby_state(state, current_epoch=0, allow_equal=False):
+def restore_lobby_state(
+    state, current_epoch=0, allow_equal=False, authority_epoch=None
+):
     validate_lobby_state(state)
+    if authority_epoch is not None and (
+        isinstance(authority_epoch, bool)
+        or not isinstance(authority_epoch, int)
+        or authority_epoch < 1
+    ):
+        raise LobbyStateError("current authority epoch is invalid")
     epoch = int(state["epoch"])
     if epoch < current_epoch or (epoch == current_epoch and not allow_equal):
         raise StaleEpochError(
@@ -127,16 +160,58 @@ def restore_lobby_state(state, current_epoch=0, allow_equal=False):
     except (TypeError, ValueError, DecodeError) as error:
         raise LobbyStateError("lobby state scene snapshot encoding is invalid") from error
 
-    shared_projection.store.restore(projections)
+    shared_projection.store.restore(
+        projections,
+        roster_seq=state.get("roster_seq", 0),
+        config_generation=state.get("config_generation", 1),
+        authority_epoch=(
+            state.get("authority_epoch", epoch)
+            if authority_epoch is None
+            else authority_epoch
+        ),
+    )
     import_scene_snapshots(decoded_scene_snapshots)
     return epoch
 
 
-def persist_lobby_state(path, state):
-    validate_lobby_state(state)
-    target = os.path.abspath(path)
-    parent = os.path.dirname(target)
-    os.makedirs(parent, exist_ok=True)
+_state_path_locks = {}
+_state_path_locks_guard = Lock()
+
+
+def _state_path_lock(target):
+    with _state_path_locks_guard:
+        return _state_path_locks.setdefault(target, RLock())
+
+
+@contextmanager
+def _locked_state_file(target):
+    with _state_path_lock(target):
+        lock_path = target + ".lock"
+        with open(lock_path, "a+b") as lock_handle:
+            lock_handle.seek(0, os.SEEK_END)
+            if lock_handle.tell() == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            lock_handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                lock_handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_lobby_state(target, state):
     temporary = target + ".tmp-" + uuid.uuid4().hex
     try:
         with open(temporary, "w", encoding="utf-8") as handle:
@@ -147,6 +222,24 @@ def persist_lobby_state(path, state):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def persist_lobby_state(path, state):
+    validate_lobby_state(state)
+    target = os.path.abspath(path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with _locked_state_file(target):
+        current = load_lobby_state(target)
+        if current is not None:
+            if state["epoch"] < current["epoch"] or (
+                state["epoch"] == current["epoch"]
+                and state["host_id"] != current["host_id"]
+            ):
+                raise StaleEpochError(
+                    f"lobby state epoch {state['epoch']} from {state['host_id']} "
+                    f"cannot replace epoch {current['epoch']} from {current['host_id']}"
+                )
+        _write_lobby_state(target, state)
 
 
 def load_lobby_state(path):
@@ -161,20 +254,23 @@ def load_lobby_state(path):
 
 
 def prepare_lobby_failover(path, new_host_id, expected_epoch=None):
-    state = load_lobby_state(path)
-    if state is None:
-        raise LobbyStateError("lobby state does not exist")
-    if expected_epoch is not None and state["epoch"] != int(expected_epoch):
-        raise StaleEpochError(
-            f"lobby state epoch {state['epoch']} does not match {expected_epoch}"
-        )
     if not isinstance(new_host_id, str) or not new_host_id:
         raise LobbyStateError("new host_id is invalid")
-    state["host_id"] = new_host_id
-    state["epoch"] += 1
-    state["failover_at"] = time.time()
-    persist_lobby_state(path, state)
-    return state
+    target = os.path.abspath(path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with _locked_state_file(target):
+        state = load_lobby_state(target)
+        if state is None:
+            raise LobbyStateError("lobby state does not exist")
+        if expected_epoch is not None and state["epoch"] != int(expected_epoch):
+            raise StaleEpochError(
+                f"lobby state epoch {state['epoch']} does not match {expected_epoch}"
+            )
+        state["host_id"] = new_host_id
+        state["epoch"] += 1
+        state["failover_at"] = time.time()
+        _write_lobby_state(target, state)
+        return state
 
 
 class LobbyHostLease:

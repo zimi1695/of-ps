@@ -1,8 +1,7 @@
-import time
+import hashlib
 
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
-
 from proto.net_pb2 import (
     RestaurantGameQuestRewardReq,
     RestaurantGameQuestRewardRsp,
@@ -11,9 +10,62 @@ from proto.net_pb2 import (
     PackNotice,
 )
 
-from utils import restaurant_game_store as store
+import utils.db as db
 from utils import item_mgr
 from utils import refresh
+from utils import restaurant_game_store as store
+from server import activities
+
+_SYSTEM = "restaurant-quest-reward"
+
+
+class _Reject(Exception):
+    def __init__(self, status):
+        self.status = status
+
+
+def _rewards(cfg):
+    rewards = []
+    try:
+        for item_key, count_key in (
+            ("game_coin_i_d", "game_coin"),
+            ("game_integral_item", "game_integral"),
+        ):
+            item_id = cfg.get(item_key, 0)
+            count = cfg.get(count_key, 0)
+            if bool(item_id) != bool(count):
+                raise item_mgr.EconomyConfigError("incomplete restaurant reward")
+            if item_id:
+                rewards.append((item_id, count))
+        validated = item_mgr.validate_rewards(rewards)
+        if not validated:
+            raise item_mgr.EconomyConfigError("empty restaurant reward")
+        is_refresh = cfg.get("is_refresh", False)
+        if not isinstance(is_refresh, bool):
+            raise item_mgr.EconomyConfigError("invalid restaurant refresh flag")
+        quest_type = cfg.get("new_restaurant_game_quest_type", 0)
+        if (
+            isinstance(quest_type, bool)
+            or not isinstance(quest_type, int)
+            or quest_type not in (0, 1)
+        ):
+            raise item_mgr.EconomyConfigError("invalid restaurant quest type")
+        if quest_type == 0:
+            param = cfg.get("param")
+            item_mgr.validate_counter(param, allow_zero=False, label="quest param")
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise item_mgr.EconomyConfigError("invalid restaurant quest config") from error
+    return validated, is_refresh, quest_type
+
+
+def _set_quest_status(rsp):
+    if rsp.status in (
+        StatusCode.StatusCode_OK,
+        StatusCode.StatusCode_REPEAT_GET_REWARD,
+    ):
+        rsp.quest.status = QuestStatus.QuestStatus_Finish
+    else:
+        rsp.quest.status = QuestStatus.QuestStatus_InProgress
 
 
 @packet_handler(MsgId.RestaurantGameQuestRewardReq)
@@ -25,72 +77,100 @@ class Handler(PacketHandler):
         rsp = RestaurantGameQuestRewardRsp()
         rsp.status = StatusCode.StatusCode_OK
         rsp.activity_id = req.activity_id
+        pack = PackNotice(status=StatusCode.StatusCode_OK)
+        fingerprint = hashlib.sha256(req.SerializeToString()).hexdigest()
 
-        cfg = store.get_quests(req.activity_id).get(req.quest_id)
-        if not cfg:
+        try:
+            with (
+                item_mgr.player_lock(session.player_id),
+                item_mgr.deferred_notifications(),
+                db.transaction(),
+            ):
+                saved = activities._load_operation(
+                    session.player_id, _SYSTEM, 0, packet_id, fingerprint
+                )
+                if saved == "conflict":
+                    rsp.status = StatusCode.StatusCode_BAD_REQ
+                    rsp.quest.quest_id = req.quest_id
+                    _set_quest_status(rsp)
+                elif saved is not None:
+                    response, saved_pack = saved
+                    rsp.ParseFromString(response)
+                    pack.ParseFromString(saved_pack)
+                else:
+                    cfg = store.get_quests(req.activity_id).get(req.quest_id)
+                    if not cfg or not store.get_desk_bags(req.activity_id):
+                        rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+                        rsp.quest.quest_id = req.quest_id
+                        _set_quest_status(rsp)
+                    else:
+                        try:
+                            rewards, is_refresh, quest_type = _rewards(cfg)
+                            state = store.get_state(session.player_id, req.activity_id)
+                            day = str(refresh.day_index())
+                            claim_key = f"{req.quest_id}:{day}"
+                            refresh_claimed = state.get("refresh_claimed", {})
+                            if not isinstance(refresh_claimed, dict):
+                                raise item_mgr.EconomyConfigError(
+                                    "invalid restaurant claim state"
+                                )
+                            if is_refresh:
+                                state["rewarded_quests"].discard(req.quest_id)
+                            if req.quest_id in state["rewarded_quests"]:
+                                raise _Reject(StatusCode.StatusCode_REPEAT_GET_REWARD)
+                            if quest_type == 0 and cfg.get("param") not in state["completed"]:
+                                raise _Reject(StatusCode.StatusCode_FAIL)
+                            if is_refresh and claim_key in refresh_claimed:
+                                raise _Reject(StatusCode.StatusCode_REPEAT_GET_REWARD)
+
+                            if is_refresh:
+                                state["refresh_claimed"] = refresh_claimed
+                                refresh_claimed[claim_key] = day
+                                for key in [
+                                    key
+                                    for key, value in refresh_claimed.items()
+                                    if value != day
+                                ]:
+                                    del refresh_claimed[key]
+                            else:
+                                state["rewarded_quests"].add(req.quest_id)
+                            item_mgr.grant_items(
+                                session.player_id,
+                                rewards,
+                                rsp_items=rsp.item_details,
+                                pack_notice=pack,
+                            )
+                            store.save_state(session.player_id, req.activity_id, state)
+                            rsp.quest.quest_id = req.quest_id
+                            _set_quest_status(rsp)
+                            activities._save_operation(
+                                session.player_id,
+                                _SYSTEM,
+                                0,
+                                packet_id,
+                                fingerprint,
+                                rsp,
+                                pack,
+                            )
+                        except (KeyError, TypeError, ValueError, OverflowError) as error:
+                            raise item_mgr.EconomyConfigError(
+                                "invalid restaurant state or config"
+                            ) from error
+        except _Reject as error:
+            rsp.Clear()
+            rsp.status = error.status
+            rsp.activity_id = req.activity_id
+            rsp.quest.quest_id = req.quest_id
+            _set_quest_status(rsp)
+            pack.Clear()
+        except item_mgr.EconomyConfigError:
+            rsp.Clear()
             rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
-            session.send(
-                MsgId.RestaurantGameQuestRewardRsp, rsp, packet_id
-            )  # 2739,2740
-            return
+            rsp.activity_id = req.activity_id
+            rsp.quest.quest_id = req.quest_id
+            _set_quest_status(rsp)
+            pack.Clear()
 
-        # 餐厅状态为玩家私有, handler 单线程执行, 不需要全局锁
-        state = store.get_state(session.player_id, req.activity_id)
-        # 类型 1(is_refresh 日常任务): 每日刷新, 不进入永久已领集合
-        is_refresh = bool(cfg.get("is_refresh"))
-        day = str(refresh.day_index())
-        if is_refresh:
-            state.setdefault("refresh_claimed", {})
-            state["rewarded_quests"].discard(req.quest_id)
-
-        if req.quest_id in state["rewarded_quests"]:
-            rsp.status = StatusCode.StatusCode_REPEAT_GET_REWARD
-        elif (
-            not cfg.get("new_restaurant_game_quest_type")
-            and cfg.get("param") not in state["completed"]
-        ):
-            # 通关任务(类型缺省 0): param = 目标关卡 id, 未通关不可领
-            rsp.status = StatusCode.StatusCode_FAIL
-        elif is_refresh and (f"{req.quest_id}:{day}" in state["refresh_claimed"]):
-            # 日常任务当日已领取
-            rsp.status = StatusCode.StatusCode_REPEAT_GET_REWARD
-        else:
-            if is_refresh:
-                state["refresh_claimed"][f"{req.quest_id}:{day}"] = day
-                # 清理过期日键
-                for k in [k for k, v in state["refresh_claimed"].items() if v != day]:
-                    del state["refresh_claimed"][k]
-            else:
-                state["rewarded_quests"].add(req.quest_id)
-        store.save_state(session.player_id, req.activity_id, state)
-
-        notice = None
-        if rsp.status == StatusCode.StatusCode_OK:
-            # 任务奖励: restaurant_game_quest 的
-            # game_coin_i_d x game_coin(1601 小游戏金币) +
-            rewards = []
-            if cfg.get("game_coin_i_d") and cfg.get("game_coin"):
-                rewards.append((cfg["game_coin_i_d"], cfg["game_coin"]))
-            if cfg.get("game_integral_item") and cfg.get("game_integral"):
-                rewards.append((cfg["game_integral_item"], cfg["game_integral"]))
-            notice = PackNotice()
-            notice.status = StatusCode.StatusCode_OK
-            item_mgr.grant_items(
-                session.player_id,
-                rewards,
-                rsp_items=rsp.item_details,
-                pack_notice=notice,
-                session=session,
-            )
-
-        rsp.quest.quest_id = req.quest_id
-        if rsp.status in (
-            StatusCode.StatusCode_OK,
-            StatusCode.StatusCode_REPEAT_GET_REWARD,
-        ):
-            rsp.quest.status = QuestStatus.QuestStatus_Finish
-        else:
-            rsp.quest.status = QuestStatus.QuestStatus_InProgress
-        session.send(MsgId.RestaurantGameQuestRewardRsp, rsp, packet_id)  # 2739,2740
-        if notice is not None:
-            session.send(MsgId.PackNotice, notice, 0)  # 1400
+        session.send(MsgId.RestaurantGameQuestRewardRsp, rsp, packet_id)
+        if pack.items:
+            session.send(MsgId.PackNotice, pack, 0)

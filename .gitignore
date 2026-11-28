@@ -23,6 +23,7 @@ build
 /main.spec
 /server.spec
 /link_pool.json
+/link_identity.bin
 .idea
 
 # 本地运行产物（不入库）

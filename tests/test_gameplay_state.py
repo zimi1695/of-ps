@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from config import Config
 from network.msg_id import MsgId
 from proto.net_pb2 import (
@@ -27,6 +28,7 @@ import handlers.DungeonFinish as dungeon_finish
 import handlers.Fishing as fishing
 import handlers.Gather as gather
 import handlers.PlaceFurniture as place
+from server import entity_authority
 import utils.db as db
 import utils.res_loader as res_loader
 from utils import item_mgr
@@ -51,6 +53,14 @@ class FakeSession:
 
 
 class GameplayStateTests(unittest.TestCase):
+    def setUp(self):
+        self.authority = entity_authority.activate(
+            Config.LOBBY_HOST_ID, Ed25519PrivateKey.generate()
+        )
+
+    def tearDown(self):
+        entity_authority.deactivate(self.authority)
+
     @classmethod
     def setUpClass(cls):
         res_loader.init()

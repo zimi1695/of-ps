@@ -875,6 +875,8 @@ message PacketHead {
     uint32 body_len = 4;
     uint32 total_pack_count = 5;
     uint32 seq_id = 6;
+    uint64 trace_id = 7;
+    uint64 produced_at_us = 8;
 }
 
 enum EGomokuOverReason {
@@ -1771,6 +1773,10 @@ message ChatMsgData {
     uint32 expression = 6;
     int64 send_time = 7;
     uint32 avatar_frame = 8;
+    uint64 session_generation = 9;
+    uint64 event_seq = 10;
+    uint64 trace_id = 11;
+    uint64 produced_at_us = 12;
 }
 
 message IntervalInfo {
@@ -2636,6 +2642,11 @@ message PlayerSceneRecordRsp {
 message PlayerSceneSyncDataNotice {
     StatusCode status = 1;
     repeated SceneSyncData data = 2;
+    uint64 config_generation = 3;
+    uint64 authority_epoch = 4;
+    uint64 roster_seq = 5;
+    uint64 trace_id = 6;
+    uint64 produced_at_us = 7;
 }
 
 message SceneSyncData {
@@ -4292,6 +4303,10 @@ message PopEmojiNotice {
     StatusCode status = 1;
     uint32 emoji_id = 2;
     uint32 from_player_id = 3;
+    uint64 session_generation = 4;
+    uint64 event_seq = 5;
+    uint64 trace_id = 6;
+    uint64 produced_at_us = 7;
 }
 
 message PopEmojiReq {
@@ -4491,6 +4506,10 @@ message SendActionNotice {
     bool is_study = 5;
     int64 end_time = 6;
     uint32 multiple_need_count = 8;
+    uint64 session_generation = 9;
+    uint64 event_seq = 10;
+    uint64 trace_id = 11;
+    uint64 produced_at_us = 12;
 }
 
 message SendActionStudyNotice {
@@ -6571,6 +6590,13 @@ message LinkNegotiate {
     uint32 conv = 2;
     string server_name = 3;
     bool is_public = 4; // 本机地址是否可被其他服务器直连(用于gossip分享地址)
+    string node_id = 5;
+    bytes public_key = 6;
+    string channel_id = 7;
+    bytes signature = 8;
+    uint64 nonce = 9;
+    uint64 issued_at_us = 10;
+    bytes ephemeral_public = 11;
 }
 
 message LinkPacket {
@@ -6594,6 +6620,21 @@ message PlayerInfo {
     bytes scene_player = 8;
 }
 
+message EntityOwnershipTransfer {
+    string domain = 1;
+    uint64 authority_epoch = 2;
+    uint64 entity_id = 3;
+    uint64 prior_owner_generation = 4;
+    string prior_owner_id = 5;
+    uint64 new_owner_generation = 6;
+    string new_owner_id = 7;
+    uint64 transfer_seq = 8;
+    bytes signature = 9;
+    uint64 issued_at_us = 10;
+    bytes new_owner_public_key = 11;
+    bytes signer_public_key = 12;
+}
+
 message LinkMessage {
     enum Type {
         HEARTBEAT = 0;
@@ -6614,5 +6655,16 @@ message LinkMessage {
     repeated string peer_names = 10; // HEARTBEAT: 发送方当前直连的服务器名
     repeated uint64 subs = 11;       // HEARTBEAT: 发送方订阅的场景 (scene_id<<32|channel_id)
     bool has_state = 12;             // HEARTBEAT: 本条心跳携带 peer_names/subs
+    uint64 config_generation = 13;
+    uint64 authority_epoch = 14;
+    uint64 event_seq = 15;
+    uint64 session_generation = 16;
+    uint64 trace_id = 17;
+    uint64 roster_seq = 18;
+    string origin_node_id = 19;
+    bytes origin_public_key = 20;
+    bytes signature = 21;
+    uint64 nonce = 22;
+    uint64 issued_at_us = 23;
 }
 //////////////////////

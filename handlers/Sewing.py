@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import math
 import random
 
 from network.packet_handler import PacketHandler, packet_handler
@@ -11,20 +13,19 @@ from proto.net_pb2 import (
     LifeBaseInfo,
     LifeType,
     StatusCode,
-    ItemDetail,
 )
 
 import utils.db as db
 import utils.life_achieve as life_achieve
 from utils import achieve_track, item_mgr
-from utils.pb_create import make_item
 from utils.res_loader import res
+from server import activities
 
 logger = logging.getLogger(__name__)
+_SYSTEM = "sewing"
 
 
 def _life_level(player_id):
-    """当前纺织生活等级(无记录按 1)"""
     life_blob = db.get_life(player_id, LifeType.LIFE_TYPE_Sewing)
     if life_blob and isinstance(life_blob, (bytes, bytearray)):
         info = LifeBaseInfo()
@@ -33,14 +34,37 @@ def _life_level(player_id):
     return 1
 
 
-"""
-# 纺织(缝纫) 1385 1386 —— 配方表 Spin.spin_item(纺织=Spin)
-# {i_d, spin_level, need_item_i_d/need_item_count(精力11),
-#  spin_items(材料), successful_probability, get_item_i_d(成品)}
-# 行为与早期烹饪/手工艺同口径:
-#   校验配方 → 等级 → 汇总精力+材料 → 扣耗(PackNotice) →
-#   按概率判定成败 → 成功发放成品并计入图鉴/成就 → 熟练度+10 推送
-"""
+def _costs(recipe, level_key):
+    needs = {}
+
+    def add(item_id, count):
+        item_mgr.validate_stackable_item_id(item_id)
+        item_mgr.validate_count(count, allow_zero=True)
+        if count:
+            needs[item_id] = item_mgr.checked_add(needs.get(item_id, 0), count)
+
+    try:
+        item_mgr.validate_counter(recipe.get(level_key, 0), label="craft level")
+        need_id = recipe.get("need_item_i_d")
+        if need_id:
+            add(need_id, recipe.get("need_item_count", 0))
+        for material in recipe.get("spin_items", ()):
+            add(material.get("item_i_d"), material.get("item_count", 0))
+        probability = recipe.get("successful_probability", 1)
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(probability)
+            or not 0 <= probability <= 1
+        ):
+            raise item_mgr.EconomyConfigError("invalid sewing probability")
+        product_id = recipe.get("get_item_i_d", 0)
+        if not product_id:
+            raise item_mgr.EconomyConfigError("missing sewing product")
+        item_mgr.validate_item_id(product_id)
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise item_mgr.EconomyConfigError("invalid sewing recipe") from error
+    return needs, probability, product_id
 
 
 @packet_handler(MsgId.SewingReq)
@@ -54,117 +78,114 @@ class Handler(PacketHandler):
         result = rsp.life_common_result
         result.life_type = LifeType.LIFE_TYPE_Sewing
         result.is_success = False
+        pack = PackNotice(status=StatusCode.StatusCode_OK)
+        fingerprint = hashlib.sha256(req.SerializeToString()).hexdigest()
 
-        # 查配方
-        recipe = None
-        for e in res["Spin"]["spin_item"]["datas"]:
-            if e.get("i_d") == req.sewing_id:
-                recipe = e
-                break
-        if not recipe:
+        replay = False
+        life_notice = None
+        try:
+            with (
+                item_mgr.player_lock(session.player_id),
+                item_mgr.deferred_notifications(),
+                achieve_track.batch(session),
+                db.transaction(),
+            ):
+                saved = activities._load_operation(
+                    session.player_id, _SYSTEM, 0, packet_id, fingerprint
+                )
+                if saved == "conflict":
+                    rsp.status = StatusCode.StatusCode_BAD_REQ
+                elif saved is not None:
+                    response, saved_pack = saved
+                    rsp.ParseFromString(response)
+                    pack.ParseFromString(saved_pack)
+                    replay = True
+                else:
+                    recipe = next(
+                        (
+                            row
+                            for row in res.get("Spin", {})
+                            .get("spin_item", {})
+                            .get("datas", ())
+                            if row.get("i_d") == req.sewing_id
+                        ),
+                        None,
+                    )
+                    if not recipe:
+                        rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+                    else:
+                        needs, probability, product_id = _costs(recipe, "spin_level")
+                        if recipe.get("spin_level", 0) > _life_level(session.player_id):
+                            rsp.status = StatusCode.StatusCode_LifeLvNotEnough
+                        elif not item_mgr.consume_items(
+                            session.player_id, list(needs.items()), pack_notice=pack
+                        ):
+                            rsp.status = (
+                                StatusCode.StatusCode_EnergyNotEnough
+                                if 11 in needs
+                                else StatusCode.StatusCode_ITEM_NOT_ENOUGH
+                            )
+                        else:
+                            with achieve_track.batch(session):
+                                if random.random() < probability:
+                                    item_mgr.grant_items(
+                                        session.player_id,
+                                        [(product_id, 1)],
+                                        rsp_items=result.result_items,
+                                        pack_notice=pack,
+                                    )
+                                    result.is_success = True
+                                    db.incr_kv(
+                                        session.player_id,
+                                        "life_book",
+                                        "5:" + str(product_id),
+                                        1,
+                                    )
+                                    achieve_track.report(
+                                        session, "craft_sewing", match=product_id
+                                    )
+                                life_blob = db.get_life(
+                                    session.player_id, LifeType.LIFE_TYPE_Sewing
+                                )
+                                if life_blob:
+                                    info = LifeBaseInfo()
+                                    info.ParseFromString(life_blob)
+                                    info.proficiency_value += 10
+                                    db.set_life(
+                                        session.player_id,
+                                        LifeType.LIFE_TYPE_Sewing,
+                                        info.SerializeToString(),
+                                    )
+                                    life_notice = LifeProficiencyNotice(
+                                        status=StatusCode.StatusCode_OK
+                                    )
+                                    life_notice.life_proficiency.life_type = (
+                                        LifeType.LIFE_TYPE_Sewing
+                                    )
+                                    life_notice.life_proficiency.proficiency_value = (
+                                        info.proficiency_value
+                                    )
+                                activities._save_operation(
+                                    session.player_id,
+                                    _SYSTEM,
+                                    0,
+                                    packet_id,
+                                    fingerprint,
+                                    rsp,
+                                    pack,
+                                )
+        except item_mgr.EconomyConfigError:
+            rsp.Clear()
             rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
-            session.send(MsgId.SewingRsp, rsp, packet_id)  # 1385,1386
-            return
+            rsp.life_common_result.life_type = LifeType.LIFE_TYPE_Sewing
+            pack.Clear()
 
-        # 纺织等级校验(spin_level vs 生活等级)
-        if recipe.get("spin_level", 0) > _life_level(session.player_id):
-            rsp.status = StatusCode.StatusCode_LifeLvNotEnough
+        if pack.items:
+            session.send(MsgId.PackNotice, pack, 0)
+        if replay:
             session.send(MsgId.SewingRsp, rsp, packet_id)
             return
-
-        # 汇总消耗: 精力(need_item_i_d=11) + 材料(spin_items)
-        needs = {}
-        need_item_id = recipe.get("need_item_i_d")
-        if need_item_id:
-            needs[need_item_id] = needs.get(need_item_id, 0) + recipe.get(
-                "need_item_count", 0
-            )
-        for m in recipe.get("spin_items", ()):
-            if m.get("item_i_d"):
-                needs[m["item_i_d"]] = needs.get(m["item_i_d"], 0) + m.get(
-                    "item_count", 0
-                )
-        details = {}
-        for item_id, count in needs.items():
-            blob = db.get_item_detail(session.player_id, item_id)
-            detail = ItemDetail()
-            if blob and isinstance(blob, (bytes, bytearray)):
-                detail.ParseFromString(blob)
-            else:
-                made = make_item(item_id, 0, session.player_id)
-                detail = made if isinstance(made, ItemDetail) else detail
-            if detail.main_item.base_item.num < count:
-                logger.info(
-                    "sewing short: need %s x%s, have %s",
-                    item_id,
-                    count,
-                    detail.main_item.base_item.num,
-                )
-                if item_id == 11:
-                    rsp.status = StatusCode.StatusCode_EnergyNotEnough
-                else:
-                    rsp.status = StatusCode.StatusCode_ITEM_NOT_ENOUGH
-                session.send(MsgId.SewingRsp, rsp, packet_id)  # 1385,1386
-                return
-            details[item_id] = detail
-
-        # 扣除消耗(成功失败均扣; need_time 织造耗时不延迟下发, 即时完成)
-        pack = PackNotice()
-        pack.status = StatusCode.StatusCode_OK
-        for item_id, count in needs.items():
-            detail = details[item_id]
-            detail.main_item.base_item.num -= count
-            db.set_item_detail(
-                session.player_id, detail.SerializeToString(), item_id, None
-            )
-            pack.items.add().CopyFrom(detail)
-
-        # 按 successful_probability 判定成败, 成功发放成品 get_item_i_d
-        if random.random() < float(recipe.get("successful_probability", 1)):
-            result.is_success = True
-            get_item_id = recipe.get("get_item_i_d", req.sewing_id)
-            get_blob = db.get_item_detail(session.player_id, get_item_id)
-            if get_blob:
-                get_detail = ItemDetail()
-                get_detail.ParseFromString(get_blob)
-                get_detail.main_item.base_item.num += 1
-            else:
-                # 时装子表缺配置时 make_item 可能异常, 须校验
-                get_detail = make_item(get_item_id, 1, session.player_id)
-                if not isinstance(get_detail, ItemDetail):
-                    rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
-                    session.send(MsgId.PackNotice, pack, 0)  # 1400
-                    session.send(MsgId.SewingRsp, rsp, packet_id)
-                    return
-            item_mgr.mark_new_item(session.player_id, get_detail)
-            db.set_item_detail(
-                session.player_id, get_detail.SerializeToString(), get_item_id
-            )
-            pack.items.add().CopyFrom(get_detail)
-            get_detail.main_item.base_item.num = 1
-            result.result_items.add().CopyFrom(get_detail)
-            # 生活图鉴计数
-            db.incr_kv(session.player_id, "life_book", "5:" + str(get_item_id), 1)
-            # 成就: 成功织造/纺织加工/制作[成品](事件层归族)
-            achieve_track.report(session, "craft_sewing", match=get_item_id)
-
-        session.send(MsgId.PackNotice, pack, 0)
-
-        life_blob = db.get_life(session.player_id, LifeType.LIFE_TYPE_Sewing)
-        if life_blob and isinstance(life_blob, (bytes, bytearray)):
-            info = LifeBaseInfo()
-            info.ParseFromString(life_blob)
-            info.proficiency_value += 10
-            db.set_life(
-                session.player_id,
-                LifeType.LIFE_TYPE_Sewing,
-                info.SerializeToString(),
-            )
-            notice = LifeProficiencyNotice()
-            notice.status = StatusCode.StatusCode_OK
-            notice.life_proficiency.life_type = LifeType.LIFE_TYPE_Sewing
-            notice.life_proficiency.proficiency_value = info.proficiency_value
-            session.send(MsgId.LifeProficiencyNotice, notice, 0)  # 1368
+        if life_notice is not None:
+            session.send(MsgId.LifeProficiencyNotice, life_notice, 0)
             life_achieve.notify(session, LifeType.LIFE_TYPE_Sewing)
-
-        session.send(MsgId.SewingRsp, rsp, packet_id)  # 1385,1386
+        session.send(MsgId.SewingRsp, rsp, packet_id)

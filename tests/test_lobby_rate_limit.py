@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from proto.net_pb2 import (
     PopEmojiReq,
+    PlayerSceneRecordReq,
     SendActionReq,
     SendChatMsgReq,
     StatusCode,
@@ -59,6 +60,11 @@ class TokenBucketTests(unittest.TestCase):
             TokenBucket(1, 0)
         with self.assertRaises(ValueError):
             self.bucket.consume(0)
+
+    def test_unknown_bucket_fails_closed(self):
+        limiter = SessionRateLimiter({"position": (1.0, 1)})
+        self.assertFalse(limiter.allow("unknown"))
+        self.assertTrue(limiter.allow("position"))
 
 
 class SocialRateLimitHandlerTests(unittest.TestCase):
@@ -127,6 +133,25 @@ class SocialRateLimitHandlerTests(unittest.TestCase):
         _, response, packet_id = self.responses[-1]
         self.assertEqual(response.status, StatusCode.StatusCode_REQUESTS_TOO_FREQUENT)
         self.assertEqual(packet_id, 9)
+
+    def test_position_rejection_does_not_update_projection(self):
+        from handlers.PlayerSceneRecord import Handler
+
+        self.limiter = SessionRateLimiter(
+            {"position": (0.01, 1)}, clock=lambda: self.now[0]
+        )
+        self.session.rate_limiter = self.limiter
+        self.exhaust("position")
+        Handler().handle(
+            self.session,
+            PlayerSceneRecordReq().SerializeToString(),
+            10,
+        )
+        self.assertIsNone(shared_projection.store.get(1))
+        self.assertEqual(
+            metrics.snapshot()["counters"]["ofps.rate_limit.position_rejections_total"],
+            1,
+        )
 
 
 if __name__ == "__main__":

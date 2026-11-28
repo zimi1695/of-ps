@@ -42,7 +42,9 @@ class SessionRateLimiter:
         }
 
     def allow(self, name):
-        bucket = self._buckets[name]
+        bucket = self._buckets.get(name)
+        if bucket is None:
+            return False
         allowed = bucket.consume()
         if not allowed:
             metrics_registry.metrics.inc(f"ofps.rate_limit.{name}_rejections_total")

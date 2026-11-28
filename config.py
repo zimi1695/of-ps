@@ -1,3 +1,5 @@
+import os
+
 from proto.net_pb2 import EArchaeologyType, EBagItemTag, LifeType, QuestStatus
 
 
@@ -34,11 +36,34 @@ class Config:
     ACTION_RATE_LIMIT_BURST = 10
     EMOJI_RATE_LIMIT_PER_SEC = 3.0
     EMOJI_RATE_LIMIT_BURST = 8
+    POSITION_RATE_LIMIT_PER_SEC = 30.0
+    POSITION_RATE_LIMIT_BURST = 60
     LOBBY_HOST_ID = "local-host"
     LOBBY_LEASE_SECONDS = 10.0
     LOBBY_STATE_PATH = None
     LOBBY_SNAPSHOT_INTERVAL_SEC = 1.0
     LOBBY_RESTORED_PROJECTION_TTL_SEC = 30.0
+    LOBBY_CHANNEL_ID = "public"
+    LOBBY_CONFIG_GENERATION = 1
+    LOBBY_ETCD_ENDPOINT = os.environ.get("OFPS_ETCD_ENDPOINT")
+    LOBBY_ETCD_CA_CERT = os.environ.get("OFPS_ETCD_CA_CERT")
+    LOBBY_ETCD_CERT = os.environ.get("OFPS_ETCD_CERT")
+    LOBBY_ETCD_KEY = os.environ.get("OFPS_ETCD_KEY")
+    LOBBY_ETCD_USERNAME = os.environ.get("OFPS_ETCD_USERNAME")
+    LOBBY_ETCD_PASSWORD = os.environ.get("OFPS_ETCD_PASSWORD")
+    LOBBY_ETCD_EXECUTABLE = os.environ.get("OFPS_ETCD_EXECUTABLE")
+    LOBBY_ETCD_NAME = os.environ.get("OFPS_ETCD_NAME", "etcd1")
+    LOBBY_ETCD_DATA_DIR = os.environ.get("OFPS_ETCD_DATA_DIR", "./etcd-data")
+    LOBBY_ETCD_CLIENT_URL = os.environ.get(
+        "OFPS_ETCD_CLIENT_URL", "http://127.0.0.1:2379"
+    )
+    LOBBY_ETCD_PEER_URL = os.environ.get(
+        "OFPS_ETCD_PEER_URL", "http://127.0.0.1:2380"
+    )
+    LOBBY_ETCD_INITIAL_CLUSTER = os.environ.get("OFPS_ETCD_INITIAL_CLUSTER")
+    LOBBY_ETCD_CLUSTER_TOKEN = os.environ.get(
+        "OFPS_ETCD_CLUSTER_TOKEN", "ofps-etcd-cluster"
+    )
     DEBUG_PACKET_PASS = [1007, 1008, 1203, 1206, 2201, 2202]
 
     @classmethod
@@ -67,6 +92,19 @@ class Config:
             errors.append("LOBBY_SNAPSHOT_INTERVAL_SEC must be positive")
         if cls.LOBBY_RESTORED_PROJECTION_TTL_SEC <= 0:
             errors.append("LOBBY_RESTORED_PROJECTION_TTL_SEC must be positive")
+        if cls.LOBBY_CONFIG_GENERATION < 1:
+            errors.append("LOBBY_CONFIG_GENERATION must be positive")
+        if bool(cls.LOBBY_ETCD_CERT) != bool(cls.LOBBY_ETCD_KEY):
+            errors.append("LOBBY_ETCD_CERT and LOBBY_ETCD_KEY must be provided together")
+        if cls.LOBBY_ETCD_EXECUTABLE and not cls.LOBBY_ETCD_ENDPOINT:
+            errors.append("LOBBY_ETCD_EXECUTABLE requires LOBBY_ETCD_ENDPOINT")
+        if cls.LINK_OTHER_SERVER:
+            if not cls.LINK_IDENTITY_PATH:
+                errors.append("LINK_IDENTITY_PATH is required for authenticated links")
+            if not cls.LINK_TRUSTED_NODE_IDS:
+                errors.append("LINK_TRUSTED_NODE_IDS must not be empty")
+            if cls.LINK_NEGOTIATION_MAX_SKEW_SEC <= 0:
+                errors.append("LINK_NEGOTIATION_MAX_SKEW_SEC must be positive")
         for name in (
             "CHAT_RATE_LIMIT_PER_SEC",
             "CHAT_RATE_LIMIT_BURST",
@@ -74,6 +112,8 @@ class Config:
             "ACTION_RATE_LIMIT_BURST",
             "EMOJI_RATE_LIMIT_PER_SEC",
             "EMOJI_RATE_LIMIT_BURST",
+            "POSITION_RATE_LIMIT_PER_SEC",
+            "POSITION_RATE_LIMIT_BURST",
         ):
             if getattr(cls, name) <= 0:
                 errors.append(f"{name} must be positive")
@@ -113,6 +153,14 @@ class Config:
     SELF_ADDR = ("127.0.0.1", 11000)
     LINK_POOL = []
     LINK_POOL_CACHE = "./link_pool.json"
+    LINK_CHANNEL_ID = "public"
+    LINK_IDENTITY_PATH = os.environ.get("OFPS_LINK_IDENTITY_PATH", "./link_identity.bin")
+    LINK_TRUSTED_NODE_IDS = tuple(
+        item.strip()
+        for item in os.environ.get("OFPS_LINK_TRUSTED_NODE_IDS", "").split(",")
+        if item.strip()
+    )
+    LINK_NEGOTIATION_MAX_SKEW_SEC = 30.0
     REMOTE_PLAYER_ID_BASE = 1_000_000_000
     REMOTE_PLAYER_ID_STRIDE = 1_000_000
 
@@ -297,6 +345,10 @@ class Config:
         'extra_bonus': (10, 70),
         'extra_mag': (10, 70),
     }
+
+    # (mode_id, sub_mode_id, gameplay_id) -> (三星毫秒, 二星毫秒, 一星毫秒)
+    # 未配置的玩法只结算为零星，不采信客户端 star。
+    MP_ROOM_STAR_TIMERS_MS = {}
 
     ACTIVITY_RECALL_REWARDS = {}
     DUNGEON_STAR_REWARDS = {}

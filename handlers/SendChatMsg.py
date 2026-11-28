@@ -17,8 +17,9 @@ from proto.net_pb2 import (
 from server.scene_data import up_chat_msg
 
 import utils.db as db
-from server import social
+from server import replicated_events, social
 from utils.res_loader import res
+from utils import event_trace
 
 
 def append_chat_history(msg_type: int, msg: dict, pair_key: str = ""):
@@ -71,6 +72,7 @@ class Handler(PacketHandler):
             )
             return
 
+        event_seq, trace = event_trace.next_event(session)
         message = {
             "player_id": session.player_id,
             "head": session.avatar_id,
@@ -84,6 +86,7 @@ class Handler(PacketHandler):
             ),
         }
 
+        public_response = None
         if req.type == ChatChannelType.ChatChannel_Private:
             status, stored, replayed = social.send_private_message(
                 session.player_id, req.player_id, message, packet_id
@@ -106,6 +109,10 @@ class Handler(PacketHandler):
                 notice.msg.expression = stored["expression"]
                 notice.msg.send_time = stored["send_time"]
                 notice.msg.avatar_frame = stored["avatar_frame"]
+                notice.msg.session_generation = getattr(session, "session_generation", 0)
+                notice.msg.event_seq = event_seq
+                notice.msg.trace_id = trace.trace_id
+                notice.msg.produced_at_us = trace.produced_at_us
                 for other in _gs():
                     if other.player_id == req.player_id:
                         other.send(MsgId.ChatMsgNotice, notice, 0)
@@ -122,6 +129,28 @@ class Handler(PacketHandler):
             notice.msg.expression = message["expression"]
             notice.msg.send_time = message["send_time"]
             notice.msg.avatar_frame = message["avatar_frame"]
+            notice.msg.session_generation = getattr(session, "session_generation", 0)
+            notice.msg.event_seq = event_seq
+            notice.msg.trace_id = trace.trace_id
+            notice.msg.produced_at_us = trace.produced_at_us
+            public_response = SendChatMsgRsp(
+                status=StatusCode.StatusCode_OK, text=req.text
+            )
+            event_log = replicated_events.active_log()
+            if event_log is not None:
+                recovered, committed = event_log.append_once(
+                    session.player_id,
+                    getattr(session, "session_generation", 0),
+                    session.channel_id,
+                    "chat",
+                    event_seq,
+                    notice.SerializeToString(),
+                    public_response.SerializeToString(),
+                )
+                public_response.ParseFromString(recovered)
+                if not committed:
+                    session.send(MsgId.SendChatMsgRsp, public_response, packet_id)
+                    return
             up_chat_msg(
                 session.chat_channel_id,
                 session.scene_id,
@@ -133,6 +162,7 @@ class Handler(PacketHandler):
 
         session.send(
             MsgId.SendChatMsgRsp,
-            SendChatMsgRsp(status=StatusCode.StatusCode_OK, text=req.text),
+            public_response
+            or SendChatMsgRsp(status=StatusCode.StatusCode_OK, text=req.text),
             packet_id,
         )

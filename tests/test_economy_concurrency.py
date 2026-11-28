@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from config import Config
 # 先加载 db, 保持项目既有 protobuf 工具循环导入顺序。
 import utils.db as db
@@ -45,6 +46,7 @@ import handlers.GachaFullPick as full_pick
 import handlers.Gather as gather
 import handlers.ItemUse as item_use
 import handlers.ShopBuy as shop
+from server import entity_authority
 import utils.garden_state as garden_state
 
 
@@ -77,6 +79,9 @@ class EconomyConcurrencyTests(unittest.TestCase):
         res_loader.init()
 
     def setUp(self):
+        self.authority = entity_authority.activate(
+            Config.LOBBY_HOST_ID, Ed25519PrivateKey.generate()
+        )
         self.tmp = tempfile.TemporaryDirectory()
         self.old_path = Config.DB_PATH
         self.old_memory = Config.IN_MEMORY
@@ -92,6 +97,7 @@ class EconomyConcurrencyTests(unittest.TestCase):
         self.report_patch.start()
 
     def tearDown(self):
+        entity_authority.deactivate(self.authority)
         self.report_patch.stop()
         db.exit()
         Config.DB_PATH = self.old_path
@@ -158,10 +164,10 @@ class EconomyConcurrencyTests(unittest.TestCase):
             }
         }
 
-    def buy(self, session=None, times=1):
+    def buy(self, session=None, times=1, packet_id=1):
         session = session or FakeSession()
         shop.Handler().handle(
-            session, ShopBuyReq(shop_id=1, grid_id=1, buy_times=times).SerializeToString(), 1
+            session, ShopBuyReq(shop_id=1, grid_id=1, buy_times=times).SerializeToString(), packet_id
         )
         return session.response(MsgId.ShopBuyRsp)
 
@@ -170,7 +176,8 @@ class EconomyConcurrencyTests(unittest.TestCase):
         sessions = [FakeSession() for _ in range(8)]
         with patch.dict(res_loader.res, self.shop_resources()):
             statuses = self.concurrently([
-                (lambda session=session: self.buy(session).status) for session in sessions
+                (lambda session=session, packet_id=packet_id: self.buy(session, packet_id=packet_id).status)
+                for packet_id, session in enumerate(sessions, 1)
             ])
         self.assertEqual(statuses.count(StatusCode.StatusCode_OK), 1)
         self.assertEqual(statuses.count(StatusCode.StatusCode_SHOP_GRID_BUY_NUM_LIMIT), 7)
@@ -183,7 +190,8 @@ class EconomyConcurrencyTests(unittest.TestCase):
         sessions = [FakeSession() for _ in range(5)]
         with patch.dict(res_loader.res, self.shop_resources(limit=-1)):
             statuses = self.concurrently([
-                (lambda session=session: self.buy(session).status) for session in sessions
+                (lambda session=session, packet_id=packet_id: self.buy(session, packet_id=packet_id).status)
+                for packet_id, session in enumerate(sessions, 1)
             ])
         self.assertEqual(statuses, [StatusCode.StatusCode_OK] * 5)
         self.assertEqual(self.num(101), 50)
@@ -227,7 +235,7 @@ class EconomyConcurrencyTests(unittest.TestCase):
 
         resources = self.shop_resources(costs=[{"currency_i_d": 102, "price": 4}], limit=-1)
         with patch.dict(res_loader.res, resources):
-            rsp = self.buy()
+            rsp = self.buy(packet_id=2)
         self.assertEqual(rsp.status, StatusCode.StatusCode_ITEM_NOT_ENOUGH)
         self.assertEqual((self.num(102), self.num(108), self.num(104)), (0, 3, 1))
 
@@ -335,9 +343,9 @@ class EconomyConcurrencyTests(unittest.TestCase):
         with patch.dict(res_loader.res, self.gacha_resources(cap=2)), \
              patch.object(gacha.random, "choice", side_effect=lambda values: values[0]):
             statuses = self.concurrently([
-                (lambda session=session: gacha.Handler().handle(
-                    session, GachaReq(gacha_id=10, is_single=True).SerializeToString(), 1
-                )) for session in sessions
+                (lambda session=session, packet_id=packet_id: gacha.Handler().handle(
+                    session, GachaReq(gacha_id=10, is_single=True).SerializeToString(), packet_id
+                )) for packet_id, session in enumerate(sessions, 1)
             ])
         responses = [session.response(MsgId.GachaRsp) for session in sessions]
         self.assertEqual([rsp.status for rsp in responses], [StatusCode.StatusCode_OK] * 2)

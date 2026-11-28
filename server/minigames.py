@@ -125,6 +125,8 @@ def exit_member(team, player_id):
 
 
 def _reward_plan(run, star):
+    if int(star) <= 0:
+        return (), None, ()
     table = getattr(Config, "MP_ROOM_REWARDS", {})
     if not isinstance(table, dict):
         raise RoomRewardConfigError("MP_ROOM_REWARDS must be a mapping")
@@ -154,9 +156,38 @@ def _grant(player_id, rewards):
     return [base64.b64encode(item.SerializeToString()).decode("ascii") for item in granted]
 
 
-def settle(team, star, now_ms=None):
-    """Settle once and grant every original member inside one DB transaction."""
-    if isinstance(star, bool) or not isinstance(star, int) or not 0 <= star <= 3:
+def _server_star(run, duration_ms):
+    table = getattr(Config, "MP_ROOM_STAR_TIMERS_MS", {})
+    if not isinstance(table, dict):
+        raise RoomRewardConfigError("MP_ROOM_STAR_TIMERS_MS must be a mapping")
+    key = (run["mode_id"], run["sub_mode_id"], run["gameplay_id"])
+    timers = table.get(key)
+    if timers is None:
+        return 0
+    if (
+        not isinstance(timers, (list, tuple))
+        or len(timers) != 3
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in timers)
+        or not timers[0] <= timers[1] <= timers[2]
+    ):
+        raise RoomRewardConfigError("invalid MP room star timers")
+    for star, limit in zip((3, 2, 1), timers):
+        if duration_ms <= limit:
+            return star
+    return 0
+
+
+def settle(team, star=None, now_ms=None, reported_star=None):
+    """Settle once using server-run timing; explicit star is for trusted internal callers."""
+    if reported_star is not None and (
+        isinstance(reported_star, bool)
+        or not isinstance(reported_star, int)
+        or not 0 <= reported_star <= 3
+    ):
+        raise RoomStateError("invalid reported room star")
+    if star is not None and (
+        isinstance(star, bool) or not isinstance(star, int) or not 0 <= star <= 3
+    ):
         raise RoomStateError("invalid room star")
     now_ms = int(time.time() * 1000 if now_ms is None else now_ms)
     with lock:
@@ -165,7 +196,9 @@ def settle(team, star, now_ms=None):
             return run, False
         if run["status"] != "active" or not run.get("start_ms"):
             raise RoomStateError("room has not started")
-        items, quota_kind, quota_items = _reward_plan(run, star)
+        duration = max(0, now_ms - int(run["start_ms"]))
+        authoritative_star = _server_star(run, duration) if star is None else int(star)
+        items, quota_kind, quota_items = _reward_plan(run, authoritative_star)
         member_ids = sorted(int(pid) for pid in run["members"])
         # 必须先按玩家 id 排序获取全部玩家锁, 再进入 DB 事务。
         with ExitStack() as stack:
@@ -180,6 +213,8 @@ def settle(team, star, now_ms=None):
                 if run["status"] != "active" or not run.get("start_ms"):
                     raise RoomStateError("room has not started")
                 duration = max(0, now_ms - int(run["start_ms"]))
+                authoritative_star = _server_star(run, duration) if star is None else int(star)
+                items, quota_kind, quota_items = _reward_plan(run, authoritative_star)
                 results = {}
                 for player_id in member_ids:
                     base = _grant(player_id, items)
@@ -193,7 +228,8 @@ def settle(team, star, now_ms=None):
                         "extra_items": extra,
                     }
                 run["status"] = "settled"
-                run["star"] = int(star)
+                run["star"] = int(authoritative_star)
+                run["reported_star"] = int(reported_star or 0)
                 run["duration_ms"] = duration
                 run["end_ms"] = now_ms
                 run["results"] = results

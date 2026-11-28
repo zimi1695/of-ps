@@ -7,6 +7,7 @@ from config import Config
 from proto.net_pb2 import PlayerLoginReq, PlayerLoginRsp, StatusCode
 import utils.db as db
 import server.scene_data as scene_data
+from server import replicated_roster
 from utils import achieve_track
 
 
@@ -64,4 +65,11 @@ class Handler(PacketHandler):
         rsp.channel_id = session.channel_id
         session.player_name = rsp.player_name
         session.logged_in = True
+        replicator = replicated_roster.active()
+        if replicator is not None:
+            try:
+                replicator.publish()
+            except Exception:
+                session.logged_in = False
+                raise
         session.send(MsgId.PlayerLoginRsp, rsp, packet_id)  # 1003,1004

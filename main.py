@@ -7,8 +7,10 @@ import http_server.server as http_server
 from config import Config
 from network.game_server import GameServer
 import network.remote_link as remote_link
+import server.etcd_sidecar as etcd_sidecar
 import server.notice_sync as notice_sync
 import server.photo_share as photo_share
+from server import entity_authority, link_identity
 import utils.cmd as cmd
 import utils.db as db
 from utils import metrics as metrics_registry
@@ -78,6 +80,8 @@ def main():
     http_thread = None
     game_server = None
     game_server_thread = None
+    sidecar = None
+    entity_authority_instance = None
     db_started = False
     photo_loaded = False
     shutdown_ok = True
@@ -87,12 +91,27 @@ def main():
         res_loader.init()
         db_started = True
         db.init()
+        entity_authority_instance = entity_authority.activate(
+            Config.LOBBY_HOST_ID,
+            link_identity.load_or_create_identity(Config.LINK_IDENTITY_PATH),
+        )
 
         photo_share.load()
         photo_loaded = True
 
         http_thread = threading.Thread(target=http_server.start, name="http-server", daemon=True)
         http_thread.start()
+
+        if Config.LOBBY_ETCD_EXECUTABLE:
+            sidecar = etcd_sidecar.EtcdSidecar(
+                Config.LOBBY_ETCD_EXECUTABLE,
+                name=Config.LOBBY_ETCD_NAME,
+                data_dir=Config.LOBBY_ETCD_DATA_DIR,
+                client_url=Config.LOBBY_ETCD_CLIENT_URL,
+                peer_url=Config.LOBBY_ETCD_PEER_URL,
+                initial_cluster=Config.LOBBY_ETCD_INITIAL_CLUSTER,
+                initial_cluster_token=Config.LOBBY_ETCD_CLUSTER_TOKEN,
+            ).start()
 
         game_server = GameServer()
         game_server_thread = threading.Thread(
@@ -117,6 +136,8 @@ def main():
                 )
             if notice_sync.failed():
                 raise RuntimeError("Notice sync failed")
+            if sidecar is not None and not sidecar.check_health():
+                raise RuntimeError("Local etcd sidecar is unhealthy")
             if http_server.startup_error():
                 raise RuntimeError(
                     "HTTP server failed: " + str(http_server.startup_error())
@@ -131,7 +152,11 @@ def main():
 
         if game_server is not None:
             shutdown_ok &= _shutdown_step("game server", game_server.stop)
+        if entity_authority_instance is not None:
+            entity_authority.deactivate(entity_authority_instance)
         shutdown_ok &= _shutdown_step("remote link", remote_link.stop)
+        if sidecar is not None:
+            shutdown_ok &= _shutdown_step("etcd sidecar", sidecar.stop)
 
         if http_thread is not None:
             shutdown_ok &= _shutdown_step("HTTP server", http_server.stop)

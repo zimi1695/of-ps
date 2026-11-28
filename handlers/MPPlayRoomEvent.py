@@ -34,22 +34,29 @@ class Handler(PacketHandler):
                 rsp.status = StatusCode.StatusCode_BAD_REQ
                 session.send(MsgId.MPPlayRoomEventRsp, rsp, packet_id)
                 return
-            if req.events:
-                notice = MPPlayRoomEventNotice(status=StatusCode.StatusCode_OK)
-                for event in req.events:
-                    notice.events.add().CopyFrom(event)
-                mp_team.broadcast(team, MsgId.MPPlayRoomEventNotice, notice, exclude=session.player_id)
-            for event in req.events:
-                if event.event_type != MPPlayRoomEventType.MPPlayRoomEvent_GameEnd:
-                    continue
+            end_events = [
+                event
+                for event in req.events
+                if event.event_type == MPPlayRoomEventType.MPPlayRoomEvent_GameEnd
+            ]
+            if len(end_events) > 1 or (end_events and team["leader"] != session.player_id):
+                rsp.status = StatusCode.StatusCode_BAD_REQ
+                session.send(MsgId.MPPlayRoomEventRsp, rsp, packet_id)
+                return
+
+            if end_events:
                 try:
-                    run, changed = minigames.settle(team, int(event.star))
+                    run, changed = minigames.settle(
+                        team, reported_star=int(end_events[0].star)
+                    )
                 except minigames.RoomRewardConfigError:
                     rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
-                    break
+                    session.send(MsgId.MPPlayRoomEventRsp, rsp, packet_id)
+                    return
                 except minigames.RoomStateError:
                     rsp.status = StatusCode.StatusCode_BAD_REQ
-                    break
+                    session.send(MsgId.MPPlayRoomEventRsp, rsp, packet_id)
+                    return
                 if changed:
                     room["ended"] = True
                     for player_id in sorted(int(pid) for pid in run["members"]):
@@ -60,7 +67,23 @@ class Handler(PacketHandler):
                     if team["beacon"] is not None:
                         team["beacon"]["status"] = MPBeaconStatus.MPBeaconStatus_PLACED
                     mp_team._persist()
-                break
-            else:
-                rsp.status = StatusCode.StatusCode_OK
+
+            if req.events:
+                notice = MPPlayRoomEventNotice(status=StatusCode.StatusCode_OK)
+                now_ms = int(time.time() * 1000)
+                for event in req.events:
+                    clean = notice.events.add()
+                    clean.CopyFrom(event)
+                    clean.player_id = session.player_id
+                    clean.play_mode = team["game_mode"]
+                    clean.time = now_ms
+                    clean.game_start_time = int(run.get("start_ms") or room["game_start_time"])
+                    if event.event_type == MPPlayRoomEventType.MPPlayRoomEvent_GameEnd:
+                        clean.star = int(run["star"])
+                        clean.count = 0
+                        clean.time = int(run["end_ms"])
+                    else:
+                        clean.star = 0
+                mp_team.broadcast(team, MsgId.MPPlayRoomEventNotice, notice, exclude=session.player_id)
+            rsp.status = StatusCode.StatusCode_OK
         session.send(MsgId.MPPlayRoomEventRsp, rsp, packet_id)

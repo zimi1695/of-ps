@@ -55,13 +55,49 @@ class ProjectionStore:
     def __init__(self):
         self._lock = threading.RLock()
         self._items: Dict[int, SharedProjection] = {}
+        self._config_generation = 1
+        self._authority_epoch = 1
+        self._roster_seq = 0
 
     def locked(self):
         return self._lock
 
+    def set_authority(self, config_generation, authority_epoch):
+        config_generation = int(config_generation)
+        authority_epoch = int(authority_epoch)
+        if config_generation < 1 or authority_epoch < 1:
+            raise ValueError("authority versions must be positive")
+        with self._lock:
+            if (
+                config_generation < self._config_generation
+                or authority_epoch < self._authority_epoch
+            ):
+                raise ValueError("authority versions cannot move backwards")
+            self._config_generation = config_generation
+            self._authority_epoch = authority_epoch
+            self._roster_seq += 1
+
+    def bump_roster(self):
+        with self._lock:
+            self._roster_seq += 1
+            return self._roster_seq
+
+    def roster_metadata(self):
+        with self._lock:
+            return {
+                "config_generation": self._config_generation,
+                "authority_epoch": self._authority_epoch,
+                "roster_seq": self._roster_seq,
+            }
+
     def update(self, projection: SharedProjection) -> SharedProjection:
         with self._lock:
             previous = self._items.get(projection.player_id)
+            if previous is None or (
+                previous.scene_id,
+                previous.channel_id,
+            ) != (projection.scene_id, projection.channel_id):
+                self._roster_seq += 1
             version = (
                 previous.version + 1
                 if previous is not None
@@ -157,6 +193,7 @@ class ProjectionStore:
             for projection in expired:
                 self._items.pop(projection.player_id, None)
             if expired:
+                self._roster_seq += len(expired)
                 metrics_registry.metrics.inc(
                     "ofps.projection.restored_expirations_total", len(expired)
                 )
@@ -169,6 +206,7 @@ class ProjectionStore:
         with self._lock:
             removed = self._items.pop(player_id, None)
             if removed is not None:
+                self._roster_seq += 1
                 metrics_registry.metrics.inc("ofps.projection.removals_total")
                 metrics_registry.metrics.set(
                     "ofps.projection.active", len(self._items)
@@ -197,10 +235,19 @@ class ProjectionStore:
 
     def clear(self):
         with self._lock:
+            if self._items:
+                self._roster_seq += 1
             self._items.clear()
+            self._config_generation = 1
+            self._authority_epoch = 1
             metrics_registry.metrics.set("ofps.projection.active", 0)
 
-    def restore(self, items):
+    def restore(self, items, roster_seq=0, config_generation=1, authority_epoch=1):
+        config_generation = int(config_generation)
+        authority_epoch = int(authority_epoch)
+        roster_seq = int(roster_seq)
+        if min(config_generation, authority_epoch) < 1 or roster_seq < 0:
+            raise ValueError("invalid roster metadata")
         with self._lock:
             restored = {}
             for player_id, data in items.items():
@@ -218,6 +265,9 @@ class ProjectionStore:
                     restored=True,
                 )
             self._items = restored
+            self._config_generation = config_generation
+            self._authority_epoch = authority_epoch
+            self._roster_seq = roster_seq
             metrics_registry.metrics.set("ofps.projection.active", len(restored))
 
 

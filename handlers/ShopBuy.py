@@ -1,3 +1,5 @@
+import hashlib
+
 from config import Config
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
@@ -5,9 +7,13 @@ from network.msg_id import MsgId
 from proto.net_pb2 import ShopBuyReq, ShopBuyRsp, PackNotice, StatusCode
 
 import utils.db as db
+from server import activities
 from utils import achieve_track, item_mgr, shop_state
 from utils.res_loader import res
 from utils.reward_resolver import resolve_reward
+
+
+_OPERATION_SYSTEM = "shop-buy"
 
 
 def _rows(sheet, table):
@@ -48,24 +54,47 @@ class Handler(PacketHandler):
             session.send(MsgId.ShopBuyRsp, rsp, packet_id)
             return
 
+        fingerprint = hashlib.sha256(req.SerializeToString()).hexdigest()
         try:
-            with item_mgr.player_lock(session.player_id), db.transaction():
-                level_row = db.get_players_info(session.player_id, "level")
-                player_level = int(level_row[0] or 0) if level_row else 0
-                grids = shop_state.grid_rows(req.shop_id)
-                if grids is None:
-                    rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
-                else:
-                    grid = next(
-                        (row for row in grids if row.get("grid_i_d") == req.grid_id),
-                        None,
+            with (
+                item_mgr.deferred_notifications(),
+                item_mgr.player_lock(session.player_id),
+                db.transaction(),
+            ):
+                operation = (
+                    activities._load_operation(
+                        session.player_id, _OPERATION_SYSTEM, 0, packet_id, fingerprint
                     )
-                    if grid is None:
+                    if packet_id
+                    else None
+                )
+                if operation == "conflict":
+                    rsp.status = StatusCode.StatusCode_BAD_REQ
+                elif operation is not None:
+                    rsp.ParseFromString(operation[0])
+                    pack.ParseFromString(operation[1])
+                else:
+                    level_row = db.get_players_info(session.player_id, "level")
+                    player_level = int(level_row[0] or 0) if level_row else 0
+                    grids = shop_state.grid_rows(req.shop_id)
+                    if grids is None:
                         rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
                     else:
-                        self._purchase(
-                            session, req, grid, player_level, rsp, pack
+                        grid = next(
+                            (row for row in grids if row.get("grid_i_d") == req.grid_id),
+                            None,
                         )
+                        if grid is None:
+                            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+                        else:
+                            self._purchase(
+                                session, req, grid, player_level, rsp, pack
+                            )
+                            if rsp.status == StatusCode.StatusCode_OK:
+                                activities._save_operation(
+                                    session.player_id, _OPERATION_SYSTEM, 0,
+                                    packet_id, fingerprint, rsp, pack,
+                                )
         except item_mgr.EconomyConfigError:
             rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
             del rsp.items[:]

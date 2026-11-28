@@ -1,3 +1,4 @@
+import hashlib
 import random
 
 from config import Config
@@ -5,9 +6,13 @@ from network.msg_id import MsgId
 from network.packet_handler import PacketHandler, packet_handler
 from proto.net_pb2 import GachaReq, GachaRsp, ItemDetail, PackNotice, StatusCode
 import utils.db as db
+from server import activities
 from utils import achieve_track, item_mgr
 from utils.pb_create import make_item
 from utils.res_loader import res
+
+
+_OPERATION_SYSTEM = "gacha"
 
 
 def _rows(sheet, table):
@@ -77,68 +82,33 @@ class Handler(PacketHandler):
     def handle(self, session, data: bytes, packet_id: int):
         req = GachaReq()
         req.ParseFromString(data)
-        configuration = _configuration(req.gacha_id)
-        if configuration is None:
-            session.send(MsgId.GachaRsp, GachaRsp(status=StatusCode.StatusCode_CFG_NOT_FOUND), packet_id)
-            return
-        info, normal, guarantee = configuration
-        try:
-            cost_id, cost_count = _cost(info, req.is_single)
-            if not cost_id or cost_count <= 0:
-                raise item_mgr.EconomyConfigError("invalid gacha cost")
-            item_mgr.validate_stackable_item_id(cost_id)
-            draws = 1 if req.is_single else 10
-            cap = item_mgr.validate_counter(
-                int(info.get("max_times", 70) or 70), allow_zero=False, label="gacha cap"
-            )
-        except (item_mgr.EconomyConfigError, TypeError, ValueError):
-            session.send(MsgId.GachaRsp, GachaRsp(status=StatusCode.StatusCode_CFG_NOT_FOUND), packet_id)
-            return
-
+        fingerprint = hashlib.sha256(req.SerializeToString()).hexdigest()
         rsp = GachaRsp(status=StatusCode.StatusCode_OK)
-        rsp.info.gacha_id = req.gacha_id
-        rsp.info.gacha_times = draws
         pack = PackNotice(status=StatusCode.StatusCode_OK)
+        replayed = False
+        draws = 0
         try:
-            with item_mgr.player_lock(session.player_id), db.transaction():
-                counter = item_mgr.validate_counter(
-                    db.get_gacha_guarantee(session.player_id, req.gacha_id),
-                    label="gacha guarantee",
+            with (
+                item_mgr.deferred_notifications(),
+                item_mgr.player_lock(session.player_id),
+                db.transaction(),
+            ):
+                operation = (
+                    activities._load_operation(
+                        session.player_id, _OPERATION_SYSTEM, 0, packet_id, fingerprint
+                    )
+                    if packet_id
+                    else None
                 )
-                rewards = []
-                for index in range(draws):
-                    if guarantee and counter + 1 >= cap:
-                        reward = random.choice(guarantee)
-                        counter = 0
-                    else:
-                        reward = random.choice(normal)
-                        counter = item_mgr.checked_add(
-                            counter, 1, limit=Config.ECONOMY_UINT32_MAX
-                        )
-                    if (
-                        not Config.SKIP_QUESTS
-                        and req.gacha_id == 2000
-                        and req.is_single
-                        and db.get_total_gacha_num(session.player_id, 2000) == 0
-                    ):
-                        reward = 102001
-                    rewards.append(reward)
-                item_mgr.validate_rewards([(reward, 1) for reward in rewards])
-                if not item_mgr.consume_items(
-                    session.player_id,
-                    [(cost_id, cost_count)],
-                    pack_notice=pack,
-                    session=session,
-                ):
-                    rsp.status = StatusCode.StatusCode_ITEM_NOT_ENOUGH
+                if operation == "conflict":
+                    rsp.status = StatusCode.StatusCode_BAD_REQ
+                elif operation is not None:
+                    rsp.ParseFromString(operation[0])
+                    pack.ParseFromString(operation[1])
+                    replayed = True
                 else:
-                    for reward in rewards:
-                        self._grant(session, reward, rsp, pack)
-                        db.add_gacha_record(session.player_id, req.gacha_id, reward)
-                    db.set_gacha_guarantee(session.player_id, req.gacha_id, counter)
-                    if guarantee:
-                        rsp.info.guarantee = max(0, cap - counter)
-        except item_mgr.EconomyConfigError:
+                    draws = self._draw(session, req, packet_id, fingerprint, rsp, pack)
+        except (item_mgr.EconomyConfigError, TypeError, ValueError):
             rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
             del rsp.items[:]
             del pack.items[:]
@@ -148,7 +118,68 @@ class Handler(PacketHandler):
             return
         if pack.items:
             session.send(MsgId.PackNotice, pack, 0)
-        achieve_track.report(session, "gacha", amount=draws)
+        if not replayed:
+            achieve_track.report(session, "gacha", amount=draws)
+
+    def _draw(self, session, req, packet_id, fingerprint, rsp, pack):
+        configuration = _configuration(req.gacha_id)
+        if configuration is None:
+            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+            return 0
+        info, normal, guarantee = configuration
+        cost_id, cost_count = _cost(info, req.is_single)
+        if not cost_id or cost_count <= 0:
+            raise item_mgr.EconomyConfigError("invalid gacha cost")
+        item_mgr.validate_stackable_item_id(cost_id)
+        draws = 1 if req.is_single else 10
+        cap = item_mgr.validate_counter(
+            int(info.get("max_times", 70) or 70), allow_zero=False, label="gacha cap"
+        )
+        rsp.info.gacha_id = req.gacha_id
+        rsp.info.gacha_times = draws
+        counter = item_mgr.validate_counter(
+            db.get_gacha_guarantee(session.player_id, req.gacha_id),
+            label="gacha guarantee",
+        )
+        rewards = []
+        for index in range(draws):
+            if guarantee and counter + 1 >= cap:
+                reward = random.choice(guarantee)
+                counter = 0
+            else:
+                reward = random.choice(normal)
+                counter = item_mgr.checked_add(
+                    counter, 1, limit=Config.ECONOMY_UINT32_MAX
+                )
+            if (
+                not Config.SKIP_QUESTS
+                and req.gacha_id == 2000
+                and req.is_single
+                and db.get_total_gacha_num(session.player_id, 2000) == 0
+            ):
+                reward = 102001
+            rewards.append(reward)
+        item_mgr.validate_rewards([(reward, 1) for reward in rewards])
+        if not item_mgr.consume_items(
+            session.player_id,
+            [(cost_id, cost_count)],
+            pack_notice=pack,
+            session=session,
+        ):
+            rsp.status = StatusCode.StatusCode_ITEM_NOT_ENOUGH
+            return draws
+        for reward in rewards:
+            self._grant(session, reward, rsp, pack)
+            db.add_gacha_record(session.player_id, req.gacha_id, reward)
+        db.set_gacha_guarantee(session.player_id, req.gacha_id, counter)
+        if guarantee:
+            rsp.info.guarantee = max(0, cap - counter)
+        rsp.status = StatusCode.StatusCode_OK
+        activities._save_operation(
+            session.player_id, _OPERATION_SYSTEM, 0,
+            packet_id, fingerprint, rsp, pack,
+        )
+        return draws
 
     @staticmethod
     def _grant(session, reward, rsp, pack):

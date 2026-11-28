@@ -1,13 +1,14 @@
-from config import Config
-import logging
+import base64
+import hashlib
+import json
 import pickle
 import random
 import time
-import threading
 from threading import Lock
 
 from network.packet_handler import PacketHandler, packet_handler
 from network.msg_id import MsgId
+from config import Config
 
 from proto.net_pb2 import (
     ActivitySandbagHitReq,
@@ -16,99 +17,96 @@ from proto.net_pb2 import (
     StatusCode,
 )
 import utils.db as db
-from utils import achieve_track, refresh
+from utils import achieve_track, item_mgr, refresh
 from utils.res_loader import res
 
 """
 # 打沙袋: 上报打击 4503 4504 -> 掉落宝箱通知 4508
-配置来源 InteractionActivity.json activity_interaction(表内仅 i_d=10001, object_i_d=10301):
-activity_interaction_item: {index, reward_pool_group_i_d 宝箱奖池(Reward.reward_pool),
-output_ceiling 产出上限, reset_type 1=每日重置(缺省不重置), special_type}
-每次打击最多掉 1 个宝箱, 从未达上限的池里随机; 宝箱经 ActivitySandbagReward 领取
+沙包状态逐玩家保存在 player_kv(ns=sandbag), 每次命中在玩家锁和单事务内
+保存掉落、幂等响应和成就领取标记; 不再依赖内存快照。
 """
 
-# 打沙袋内存态(与 ActivitySandbagReward 共享)
-# 持久化于 kv(player_id=0, ns=sandbag), 懒加载 + 周期快照
-
-sandbag_state = {}
 lock_sandbag = Lock()
-_sb_loaded = [False]
-_sb_thread = [None]
-logger = logging.getLogger(__name__)
+_OPERATION_NS = "activity_operations"
 
 
 def sb_load():
-    if _sb_loaded[0]:
-        return
-    raw = db.get_kv(0, "sandbag", "snapshot", b"")
-    if raw:
-        data = pickle.loads(raw)
-        for pid, st in data.items():
-            st["server_claimed"] = set(st.get("server_claimed", ()))
-            sandbag_state[pid] = st
-    _sb_loaded[0] = True
-
-    if _sb_thread[0] is None or not _sb_thread[0].is_alive():
-        def _loop():
-            while True:
-                time.sleep(5)
-                if db.db is None:
-                    return
-                with lock_sandbag:
-                    snapshot = pickle.dumps(
-                        {
-                            pid: {
-                                **st,
-                                "server_claimed": list(st["server_claimed"]),
-                            }
-                            for pid, st in sandbag_state.items()
-                        }
-                    )
-                try:
-                    db.set_kv(0, "sandbag", "snapshot", snapshot)
-                except AttributeError:
-                    return
-                except Exception:
-                    logger.exception("sandbag autosave failed")
-
-        _sb_thread[0] = threading.Thread(target=_loop, daemon=True, name="sandbag-autosave")
-        _sb_thread[0].start()
+    """兼容旧调用; 权威状态总是从数据库按玩家加载。"""
 
 
-def sb_save():
-    pass  # 由周期线程统一保存
+def sb_save(player_id, state=None):
+    """保存指定玩家的沙包状态; 调用方须持 lock_sandbag 且处于事务中。"""
+    if state is None:
+        state = player_state(player_id)
+    db.set_kv(player_id, "sandbag", "state", pickle.dumps(state))
 
 
 def interaction_cfg(activity_id):
-    """activity_interaction 行; 活动 id 不匹配时容错取表内第一条(表内仅一条)"""
-    rows = res["InteractionActivity"]["activity_interaction"]["datas"]
-    for row in rows:
-        if row.get("i_d") == activity_id:
-            return row
-    if rows:
-        return rows[0]
-    return None
+    """只接受精确匹配的活动配置, 未知 ID 失败关闭。"""
+    rows = res.get("InteractionActivity", {}).get("activity_interaction", {}).get("datas", ())
+    return next((row for row in rows if row.get("i_d") == activity_id), None)
 
 
 def player_state(player_id):
-    """取(必要时创建)玩家沙袋内存态并处理每日重置; 须在 lock_sandbag 内调用"""
+    """加载(必要时创建)玩家沙包状态并处理每日重置; 须在 lock_sandbag 内调用。"""
     sb_load()
-    day = str(refresh.day_index())
-    st = sandbag_state.get(player_id)
+    raw = db.get_kv(player_id, "sandbag", "state")
+    st = pickle.loads(raw) if raw else None
+    if st is not None and (
+        not isinstance(st, dict)
+        or not isinstance(st.get("boxes"), list)
+        or not isinstance(st.get("daily_drops"), dict)
+        or not isinstance(st.get("life_drops"), dict)
+        or not isinstance(st.get("next_seq"), int)
+        or st["next_seq"] < 1
+    ):
+        raise ValueError("invalid sandbag state")
     if st is None:
         st = {
-            "day": day,
+            "day": str(refresh.day_index()),
             "daily_drops": {},
             "life_drops": {},
             "boxes": [],
             "next_seq": 1,
             "server_claimed": set(),
         }
-        sandbag_state[player_id] = st
-    elif st["day"] != day:
-        st["day"] = day
-        st["daily_drops"] = {}  # reset_type=1 的池每日重置
+    elif st["day"] != str(refresh.day_index()):
+        st["day"] = str(refresh.day_index())
+        st["daily_drops"] = {}
+    st["server_claimed"] = set(st.get("server_claimed", ()))
     return st
+
+
+def _load_hit_operation(player_id, activity_id, packet_id, fingerprint):
+    if not packet_id:
+        return None
+    raw = db.get_kv(player_id, _OPERATION_NS, f"sandbag-hit:{packet_id}")
+    if raw is None:
+        return None
+    try:
+        saved = json.loads(bytes(raw).decode("utf-8"))
+        if saved.get("fingerprint") != fingerprint:
+            return "conflict"
+        return (
+            base64.b64decode(saved["response"], validate=True),
+            base64.b64decode(saved["drop"], validate=True) if saved.get("drop") else b"",
+        )
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+        return "conflict"
+
+
+def _save_hit_operation(player_id, activity_id, packet_id, fingerprint, rsp, drop):
+    if not packet_id:
+        return
+    value = json.dumps(
+        {
+            "fingerprint": fingerprint,
+            "response": base64.b64encode(rsp.SerializeToString()).decode("ascii"),
+            "drop": base64.b64encode(drop.SerializeToString()).decode("ascii") if drop else "",
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    db.set_kv(player_id, _OPERATION_NS, f"sandbag-hit:{packet_id}", value)
 
 
 @packet_handler(MsgId.ActivitySandbagHitReq)
@@ -118,43 +116,65 @@ class Handler(PacketHandler):
         req.ParseFromString(data)
 
         rsp = ActivitySandbagHitRsp()
-        rsp.status = StatusCode.StatusCode_OK
+        rsp.status = StatusCode.StatusCode_BAD_REQ
         rsp.activity_id = req.activity_id
         rsp.npc_id = req.npc_id
         rsp.hit_count = req.hit_count
-
         cfg = interaction_cfg(req.activity_id)
-        items = cfg.get("activity_interaction_item", ()) if cfg else ()
-        hits = (
-            min(req.hit_count, Config.SANDBAG_MAX_HIT_PER_REQUEST)
-            if req.hit_count > 0
-            else 0
-        )
+        if cfg is None:
+            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+            session.send(MsgId.ActivitySandbagHitRsp, rsp, packet_id)
+            return
+        if req.npc_id != cfg.get("object_i_d", 0) or req.hit_count <= 0:
+            session.send(MsgId.ActivitySandbagHitRsp, rsp, packet_id)
+            return
+        hits = min(req.hit_count, Config.SANDBAG_MAX_HIT_PER_REQUEST)
+        items = cfg.get("activity_interaction_item", ())
+        if not items:
+            rsp.status = StatusCode.StatusCode_CFG_NOT_FOUND
+            session.send(MsgId.ActivitySandbagHitRsp, rsp, packet_id)
+            return
 
-        new_boxes = []
-        if items:
-            now = int(time.time())
-            with lock_sandbag:
+        fingerprint = hashlib.sha256(req.SerializeToString()).hexdigest()
+        drop = ActivitySandbagDropNotice()
+        first_today = False
+        replayed = False
+        with (
+            item_mgr.player_lock(session.player_id),
+            item_mgr.deferred_notifications(),
+            db.transaction(),
+            lock_sandbag,
+        ):
+            saved = _load_hit_operation(session.player_id, req.activity_id, packet_id, fingerprint)
+            if isinstance(saved, tuple):
+                rsp.ParseFromString(saved[0])
+                if saved[1]:
+                    drop.ParseFromString(saved[1])
+                replayed = True
+            elif saved == "conflict":
+                rsp.status = StatusCode.StatusCode_BAD_REQ
+            else:
                 st = player_state(session.player_id)
+                now = int(time.time())
+                new_boxes = []
                 for _ in range(hits):
                     avail = []
                     for it in items:
                         idx = it.get("index", 0)
                         ceiling = it.get("output_ceiling", 0)
-                        drops = (
-                            st["daily_drops"]
-                            if it.get("reset_type", 0) == 1
-                            else st["life_drops"]
-                        )
+                        if not isinstance(idx, int) or idx <= 0 or not isinstance(ceiling, int) or ceiling <= 0:
+                            raise ValueError("invalid sandbag interaction item")
+                        drops = st["daily_drops"] if it.get("reset_type", 0) == 1 else st["life_drops"]
                         if drops.get(idx, 0) < ceiling:
                             avail.append((it, drops))
                     if not avail:
-                        break  # 全部池达产出上限
+                        break
                     it, drops = random.choice(avail)
-                    idx = it.get("index", 0)
+                    idx = it["index"]
                     drops[idx] = drops.get(idx, 0) + 1
                     box = {
                         "seq": st["next_seq"],
+                        "activity_id": req.activity_id,
                         "pool_id": it.get("reward_pool_group_i_d", 0),
                         "create_time": now,
                         "used": False,
@@ -162,33 +182,30 @@ class Handler(PacketHandler):
                     st["next_seq"] += 1
                     st["boxes"].append(box)
                     new_boxes.append(box)
-
-        session.send(MsgId.ActivitySandbagHitRsp, rsp, packet_id)  # 4503,4504
-
-        # 成就按成功处理的攻击次数计数，而不是按掉落宝箱数计数。每日首击
-        # 使用带日期的持久化领取键去重，避免重试请求重复推进184。
-        object_id = cfg.get("object_i_d") if cfg else 0
-        if object_id and req.npc_id == object_id and hits:
-            first_today = db.try_claim(
-                session.player_id,
-                "ach_sandbag_day",
-                f"{cfg.get('i_d', req.activity_id)}:{refresh.day_index()}",
-            )
-            with achieve_track.batch(session):
-                achieve_track.report(
-                    session, "sandbag_hit", match=req.npc_id, amount=hits
+                # 先持久化状态; 任一后续发奖/幂等写入失败都会回滚本次掉落。
+                sb_save(session.player_id, st)
+                first_today = db.try_claim(
+                    session.player_id,
+                    "ach_sandbag_day",
+                    f"{req.activity_id}:{refresh.day_index()}",
                 )
+                rsp.status = StatusCode.StatusCode_OK
+                if new_boxes:
+                    drop.status = StatusCode.StatusCode_OK
+                    drop.activity_id = req.activity_id
+                    for box in new_boxes:
+                        b = drop.box_list.add()
+                        b.seq = box["seq"]
+                        b.pool_id = box["pool_id"]
+                        b.create_time = box["create_time"]
+                        b.use_status = False
+                _save_hit_operation(session.player_id, req.activity_id, packet_id, fingerprint, rsp, drop)
+
+        session.send(MsgId.ActivitySandbagHitRsp, rsp, packet_id)
+        if drop.box_list:
+            session.send(MsgId.ActivitySandbagDropNotice, drop, 0)
+        if not replayed and rsp.status == StatusCode.StatusCode_OK:
+            with achieve_track.batch(session):
+                achieve_track.report(session, "sandbag_hit", match=req.npc_id, amount=hits)
                 if first_today:
                     achieve_track.report(session, "sandbag_day", match=req.npc_id)
-
-        if new_boxes:
-            notice = ActivitySandbagDropNotice()
-            notice.status = StatusCode.StatusCode_OK
-            notice.activity_id = req.activity_id
-            for box in new_boxes:
-                b = notice.box_list.add()
-                b.seq = box["seq"]
-                b.pool_id = box["pool_id"]
-                b.create_time = box["create_time"]
-                b.use_status = False
-            session.send(MsgId.ActivitySandbagDropNotice, notice, 0)  # 4508

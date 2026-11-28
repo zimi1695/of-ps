@@ -2,7 +2,7 @@ from network.msg_id import MsgId
 from network.packet_handler import PacketHandler, packet_handler
 from proto.net_pb2 import DungeonTaskFinishRewardReq, DungeonTaskFinishRewardRsp, DungeonData, PackNotice, RewardStatus, StatusCode
 from server import abyss
-from utils import item_mgr
+from utils import dungeon_state, item_mgr
 from utils.reward_resolver import resolve_drop
 import utils.db as db
 
@@ -18,7 +18,7 @@ def _player_values(player_id):
 @packet_handler(MsgId.DungeonTaskFinishRewardReq)
 class Handler(PacketHandler):
     def handle(self, session, data: bytes, packet_id: int):
-        with dungeon_state.player_lock(session.player_id):
+        with item_mgr.player_lock(session.player_id), dungeon_state.player_lock(session.player_id):
             self._handle(session, data, packet_id)
 
     def _handle(self, session, data: bytes, packet_id: int):

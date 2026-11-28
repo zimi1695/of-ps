@@ -79,7 +79,16 @@ def wait_for_link(log_path, process, timeout=20.0):
     raise TimeoutError("KCP link did not connect")
 
 
-def start_server(python, directory, host_id, link_port, peer_link_port, log_path):
+def start_server(
+    python,
+    directory,
+    host_id,
+    link_port,
+    peer_link_port,
+    log_path,
+    identity_path,
+    trusted_node_ids,
+):
     game_port = free_tcp_port()
     http_port = free_tcp_port()
     code = r'''
@@ -109,6 +118,8 @@ Config.SELF_ADDR = Config.LINK_LISTEN
 Config.SELF_ADDR_IS_PUBLIC = True
 Config.LINK_POOL = [] if int(sys.argv[7]) == 0 else [("127.0.0.1", int(sys.argv[7]))]
 Config.LINK_POOL_CACHE = sys.argv[8]
+Config.LINK_IDENTITY_PATH = sys.argv[9]
+Config.LINK_TRUSTED_NODE_IDS = tuple(sys.argv[10].split(","))
 import main
 main.main()
 '''
@@ -129,6 +140,8 @@ main.main()
                 str(link_port),
                 str(peer_link_port),
                 str(directory / f"{host_id}.link.json"),
+                str(identity_path),
+                ",".join(trusted_node_ids),
             ],
             cwd=REPO_ROOT,
             stdout=log,
@@ -177,18 +190,33 @@ def wait_for_remote_roster(bot, timeout=8.0):
     raise TimeoutError("remote player was not in the initial scene roster")
 
 
-def wait_for_remote_position(bot, player_id, timeout=5.0):
+def wait_for_remote_position(bot, player_id, expected, timeout=5.0, observed=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             msg_id, body = bot.next_message(timeout=0.1)
         except queue.Empty:
             continue
-        if msg_id == MsgId.PlayerSceneSyncDataNotice:
-            notice = PlayerSceneSyncDataNotice.FromString(body)
-            if any(item.player_id == player_id for item in notice.data):
-                return True
-    return False
+        if msg_id != MsgId.PlayerSceneSyncDataNotice:
+            continue
+        notice = PlayerSceneSyncDataNotice.FromString(body)
+        for item in notice.data:
+            if item.player_id != player_id:
+                continue
+            for recorder in item.data:
+                if not recorder.char_recorder_data_lst:
+                    continue
+                pos = recorder.char_recorder_data_lst[0].pos
+                actual = (int(pos.x), int(pos.y), int(pos.z))
+                if observed is not None:
+                    observed.append(actual)
+                if actual == tuple(expected):
+                    return {
+                        "player_id": int(player_id),
+                        "sent": list(expected),
+                        "received": list(actual),
+                    }
+    return None
 
 
 def wait_for_remote_chat(bot, player_id, text, timeout=5.0):
@@ -253,32 +281,66 @@ def cleanup_directory(path):
 
 
 def run(python, directory):
-    result = {"passed": False, "checks": {}, "errors": []}
+    result = {"passed": False, "checks": {}, "errors": [], "events": []}
+
+    def record(event, **fields):
+        result["events"].append(
+            {"timestamp": time.time(), "event": event, **fields}
+        )
+
     processes = []
     clients = []
     try:
         from network import remote_link
+        from server import link_identity
+        from utils.secure_store import atomic_write, protect_bytes
 
         if remote_link.KCP_IMPORT_FAILED:
             raise RuntimeError(
                 "KCP extension is unavailable; build utils/kcp/setup.py first"
             )
+        identity_paths = {}
+        node_ids = {}
+        for host_id in ("host-a", "host-b"):
+            private_key = link_identity.generate_private_key()
+            raw = link_identity.serialize_private_key(private_key)
+            path = directory / f"{host_id}.identity"
+            atomic_write(path, protect_bytes(raw, b"ofps-link-identity-v1"))
+            identity_paths[host_id] = path
+            node_ids[host_id] = link_identity.node_id_for_public_key(
+                link_identity.public_key_bytes(private_key)
+            )
         link_a = free_udp_port()
         link_b = free_udp_port()
         server_a, port_a, _ = start_server(
-            python, directory, "host-a", link_a, 0, directory / "host-a.log"
+            python,
+            directory,
+            "host-a",
+            link_a,
+            0,
+            directory / "host-a.log",
+            identity_paths["host-a"],
+            [node_ids["host-b"]],
         )
         processes.append(server_a)
         wait_for_port(port_a, server_a)
         wait_for_listening(directory / "host-a.log", server_a)
         server_b, port_b, _ = start_server(
-            python, directory, "host-b", link_b, link_a, directory / "host-b.log"
+            python,
+            directory,
+            "host-b",
+            link_b,
+            link_a,
+            directory / "host-b.log",
+            identity_paths["host-b"],
+            [node_ids["host-a"]],
         )
         processes.append(server_b)
         wait_for_port(port_b, server_b)
         wait_for_listening(directory / "host-b.log", server_b)
         wait_for_link(directory / "host-b.log", server_b)
         result["checks"]["kcp_link_connected"] = True
+        record("kcp_link_connected", host_a=port_a, host_b=port_b)
 
         first = Bot(1000000, "127.0.0.1", port_a)
         clients.append(first)
@@ -291,26 +353,58 @@ def run(python, directory):
         remote_first = wait_for_remote_roster(second)
         result["checks"]["remote_enter_and_initial_roster"] = True
         result["remote_player_ids"] = [remote_first, remote_second]
+        record(
+            "remote_roster_visible",
+            first_remote_player_id=remote_first,
+            second_remote_player_id=remote_second,
+        )
 
         for index in range(10):
             first.send_position(10 + index * 2, 20)
-            second.send_position(100 + index * 2, 200)
+            second.send_position(12 + index * 2, 22)
             time.sleep(0.03)
-        result["checks"]["remote_position_to_first"] = wait_for_remote_position(
-            first, remote_second
+        first_observed = []
+        second_observed = []
+        first_position = wait_for_remote_position(
+            first, remote_second, (30, 22, 0), observed=first_observed
         )
-        result["checks"]["remote_position_to_second"] = wait_for_remote_position(
-            second, remote_first
+        second_position = wait_for_remote_position(
+            second, remote_first, (28, 20, 0), observed=second_observed
+        )
+        result["checks"]["remote_position_to_first"] = first_position is not None
+        result["checks"]["remote_position_to_second"] = second_position is not None
+        record(
+            "remote_position_coordinates_visible",
+            sync_level="protocol_coordinates",
+            client_kind="headless_protocol_bot",
+            first_remote_player_id=remote_second,
+            second_remote_player_id=remote_first,
+            first_position=first_position,
+            second_position=second_position,
+            first_observed=first_observed[-20:],
+            second_observed=second_observed[-20:],
+            first_received=result["checks"]["remote_position_to_first"],
+            second_received=result["checks"]["remote_position_to_second"],
         )
 
         first.send_chat("multi-host-chat")
         result["checks"]["cross_host_chat"] = wait_for_remote_chat(
             second, remote_first, "multi-host-chat"
         )
+        record(
+            "cross_host_chat",
+            text="multi-host-chat",
+            received=result["checks"]["cross_host_chat"],
+        )
 
         first.send_emoji(1)
         result["checks"]["cross_host_emoji"] = wait_for_remote_emoji(
             second, remote_first
+        )
+        record(
+            "cross_host_emoji",
+            emoji_id=1,
+            received=result["checks"]["cross_host_emoji"],
         )
 
         second.close()
@@ -363,6 +457,15 @@ def main():
         print(text)
         if args.output:
             args.output.write_text(text + "\n", encoding="utf-8")
+            jsonl_output = args.output.with_suffix(".jsonl")
+            jsonl_output.write_text(
+                "".join(
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                    for event in result["events"]
+                ),
+                encoding="utf-8",
+            )
         if not result["passed"]:
             raise SystemExit(1)
     finally:
